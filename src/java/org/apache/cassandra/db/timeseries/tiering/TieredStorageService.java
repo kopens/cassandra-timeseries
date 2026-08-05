@@ -132,10 +132,34 @@ public class TieredStorageService implements TieredStorageServiceMBean
     private static final Logger logger = LoggerFactory.getLogger(TieredStorageService.class);
 
     /**
-     * Network page size for the paged scans this cycle issues (tag enumeration, per-window row reads,
-     * cold-expiry candidates), and for the read path's chunk-window listing ({@link ChunkRowSource}).
+     * Network page size for the paged scans this cycle issues (per-window row reads, cold-expiry
+     * candidates), and for the read path's chunk-window listing ({@link ChunkRowSource}). Those are
+     * all single-partition reads of contiguous clusterings, where 5000 rows is one cheap slice --
+     * tag enumeration is not, and uses {@link #TAG_PAGE_SIZE} instead.
      */
     static final int PAGE_SIZE = 5000;
+
+    /**
+     * Network page size for the {@code SELECT DISTINCT} partition-key scans {@link #enumerateTags}
+     * issues, deliberately far smaller than {@link #PAGE_SIZE}.
+     * <p>
+     * A page is one range request, and it must finish inside the coordinator's read deadline or the
+     * whole scan dies with a {@link org.apache.cassandra.exceptions.ReadTimeoutException}. That
+     * deadline is <b>not</b> {@code range_request_timeout} alone: {@code RequestTime.computeDeadline}
+     * takes the <em>minimum</em> of the verb timeout and the client deadline, and the client deadline
+     * of an internally-issued query is {@code native_transport_timeout} (12s by default). Raising
+     * {@code range_request_timeout} therefore does nothing for this scan -- the only lever this code
+     * owns is how much work it asks for per page.
+     * <p>
+     * And a page of a DISTINCT scan is expensive per row in a way a clustering slice is not: each row
+     * is a different partition, so the coordinator seeks the first live row of every one of them
+     * across every SSTable the range touches. On a wide time-series table (many SSTables, multi-MB
+     * partitions, compressed) that is milliseconds per partition, not microseconds -- measured at
+     * ~19ms/partition on a production table of 11.6k tags, i.e. a 5000-row page would need ~95s
+     * against a 12s deadline and could never complete, at any table size that matters. 256 keeps a
+     * page to a few seconds there, with the deadline an order of magnitude away.
+     */
+    static final int TAG_PAGE_SIZE = 256;
 
     public static final String MBEAN_NAME = "org.apache.cassandra.db:type=TieredStorage";
 
@@ -160,6 +184,11 @@ public class TieredStorageService implements TieredStorageServiceMBean
          * is tiered up to the cutoff" outcome a completed cycle reports. A one-shot
          * {@code nodetool retier} that skipped tags fails rather than reporting success (see
          * {@link #retier}); the scheduled sweep logs and retries them next tick.
+         * <p>
+         * A failed <em>enumeration</em> range counts here too (see {@link #collectTagsIsolated}), as
+         * one unit rather than as the tags it would have yielded -- how many those were is precisely
+         * what could not be determined. The distinction does not matter to either consumer: both
+         * treat any non-zero value as "this cycle under-encoded, look at the log".
          */
         public long tagsSkipped;
     }
@@ -170,6 +199,19 @@ public class TieredStorageService implements TieredStorageServiceMBean
     private final ConcurrentHashMap<String, AtomicBoolean> runningGates = new ConcurrentHashMap<>();
     /** {@code "keyspace.table"} -> epoch millis of that table's last *completed* run. */
     private final ConcurrentHashMap<String, Long> lastRunAtMillisByTable = new ConcurrentHashMap<>();
+    /**
+     * {@code "keyspace.table"} -> epoch millis of that table's last *attempted* run, completed or
+     * not. This, not {@link #lastRunAtMillisByTable}, is what gates the sweep ({@link #dueForSweep}).
+     * <p>
+     * Gating on completions instead made a failing table ignore its own {@code interval} entirely:
+     * the timestamp only advanced after a successful {@link #runOnce}, so a table that throws every
+     * time is permanently "never run" and is re-attempted on <b>every</b> {@value #SWEEP_DELAY_SECONDS}s
+     * tick. For a failure mode whose cost is a full-table scan -- the expensive case, and the likely
+     * one, since cheap work rarely fails -- that turns a table's own trouble into a load source that
+     * makes it worse, and starves every table iterated after it. Attempts are what the interval is
+     * meant to space out; completions are what {@link #statusRows} reports.
+     */
+    private final ConcurrentHashMap<String, Long> lastAttemptAtMillisByTable = new ConcurrentHashMap<>();
     /** {@code "keyspace.table"} -> stats from that table's last *completed* run. */
     private final ConcurrentHashMap<String, TierRunStats> lastStatsByTable = new ConcurrentHashMap<>();
 
@@ -284,8 +326,8 @@ public class TieredStorageService implements TieredStorageServiceMBean
         if (policy == null)
             return false;
 
-        Long lastRun = lastRunAtMillisByTable.get(key(keyspace, table.name));
-        return lastRun == null || now - lastRun >= policy.intervalMillis;
+        Long lastAttempt = lastAttemptAtMillisByTable.get(key(keyspace, table.name));
+        return lastAttempt == null || now - lastAttempt >= policy.intervalMillis;
     }
 
     /**
@@ -330,6 +372,10 @@ public class TieredStorageService implements TieredStorageServiceMBean
         }
         finally
         {
+            // In the finally, so a run that threw still spaces the next attempt by the table's own
+            // interval -- see lastAttemptAtMillisByTable for why gating on completions alone turned a
+            // failing table into a per-tick full-table scan.
+            lastAttemptAtMillisByTable.put(key, Clock.Global.currentTimeMillis());
             gate.set(false);
         }
 
@@ -587,7 +633,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
                                            chunkRef, tagPredicate);
         String deleteExpiredQuery = format("DELETE FROM %s WHERE %s AND window_start < ?", chunkRef, tagPredicate);
 
-        for (List<ByteBuffer> tag : enumerateTags(base, tagCqlList, tagRawNames, baseRef, cl))
+        for (List<ByteBuffer> tag : enumerateTags(base, tagCqlList, tagRawNames, baseRef, cl, stats))
         {
             // One tag's worth of trouble -- a corrupt existing chunk, a read/write timeout, anything --
             // must not wedge every other tag on this table out of being re-encoded for good.
@@ -870,7 +916,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
             TableMetadata chunkMeta = Schema.instance.getTableMetadata(keyspace, ChunkTables.chunkTableName(table));
             if (chunkMeta != null)
             {
-                for (List<ByteBuffer> tag : enumerateTags(chunkMeta, tagCqlList, tagRawNames, chunkRef, cl))
+                for (List<ByteBuffer> tag : enumerateTags(chunkMeta, tagCqlList, tagRawNames, chunkRef, cl, stats))
                 {
                     try
                     {
@@ -1048,7 +1094,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
      * nothing -- this falls back to an unrestricted scan of every tag.
      */
     private static List<List<ByteBuffer>> enumerateTags(TableMetadata base, String tagCqlList, List<String> tagRawNames,
-                                                        String baseRef, ConsistencyLevel cl)
+                                                        String baseRef, ConsistencyLevel cl, TierRunStats stats)
     {
         // LinkedHashSet of List<ByteBuffer>: List's equals/hashCode are the element-wise ones, so a
         // composite key deduplicates on all of its columns, not on identity.
@@ -1059,8 +1105,8 @@ public class TieredStorageService implements TieredStorageServiceMBean
         {
             logger.warn("Tiered storage: {}.{} has no local primary ranges reported for this node; falling back " +
                         "to an unrestricted tag scan rather than silently skipping data", base.keyspace, base.name);
-            collectTags(tags, format("SELECT DISTINCT %s FROM %s", tagCqlList, baseRef), tagRawNames, cl,
-                        Collections.emptyList());
+            collectTagsIsolated(tags, format("SELECT DISTINCT %s FROM %s", tagCqlList, baseRef), tagRawNames, cl,
+                                Collections.emptyList(), base, "the whole ring", stats);
             return new ArrayList<>(tags);
         }
 
@@ -1071,11 +1117,43 @@ public class TieredStorageService implements TieredStorageServiceMBean
             {
                 List<ByteBuffer> values = new ArrayList<>(2);
                 String query = tagRangeQuery(tagCqlList, baseRef, sub, tokenType, values);
-                collectTags(tags, query, tagRawNames, cl, values);
+                collectTagsIsolated(tags, query, tagRawNames, cl, values, base, sub.toString(), stats);
             }
         }
 
         return new ArrayList<>(tags);
+    }
+
+    /**
+     * {@link #collectTags} with one token range's failure confined to that range.
+     * <p>
+     * Enumeration is the one step of a cycle that used to have no isolation at all: every per-tag
+     * failure is caught and counted (see {@link #runOnceInner}), but a single range scan throwing --
+     * a read timeout, an unavailable replica -- propagated out of the whole {@code runOnce}, so the
+     * ranges after it were never even attempted and the table encoded nothing. That is not a
+     * hypothetical: a table whose DISTINCT scan cannot finish inside the read deadline fails on the
+     * same range every tick, forever, and its chunk table stays empty while the log shows only a
+     * generic per-table sweep warning.
+     * <p>
+     * A range that fails is counted in {@link TierRunStats#tagsSkipped} -- an unknown, non-zero
+     * number of tags went unenumerated, so the cycle emphatically did not do everything it was asked
+     * to, and {@code nodetool retier} must fail rather than report success (see {@link #runGuarded}).
+     */
+    private static void collectTagsIsolated(Set<List<ByteBuffer>> out, String query, List<String> tagRawNames,
+                                            ConsistencyLevel cl, List<ByteBuffer> values, TableMetadata base,
+                                            String rangeDescription, TierRunStats stats)
+    {
+        try
+        {
+            collectTags(out, query, tagRawNames, cl, values);
+        }
+        catch (RuntimeException e)
+        {
+            stats.tagsSkipped++;
+            logger.error("Tiered storage: {}.{} failed to enumerate tags over token range {} -- the tags in that " +
+                         "range are not re-encoded this cycle; continuing with the remaining ranges and retrying " +
+                         "next cycle", base.keyspace, base.name, rangeDescription, e);
+        }
     }
 
     /**
@@ -1112,7 +1190,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
     private static void collectTags(Set<List<ByteBuffer>> out, String query, List<String> tagRawNames,
                                      ConsistencyLevel cl, List<ByteBuffer> values)
     {
-        for (UntypedResultSet.Row row : pagedSelect(query, cl, values))
+        for (UntypedResultSet.Row row : pagedSelect(query, cl, values, Integer.MAX_VALUE, TAG_PAGE_SIZE))
         {
             List<ByteBuffer> tag = new ArrayList<>(tagRawNames.size());
             for (String name : tagRawNames)
@@ -1196,12 +1274,23 @@ public class TieredStorageService implements TieredStorageServiceMBean
     private static List<UntypedResultSet.Row> pagedSelect(String query, ConsistencyLevel cl, List<ByteBuffer> values,
                                                           int maxRows)
     {
+        return pagedSelect(query, cl, values, maxRows, PAGE_SIZE);
+    }
+
+    /**
+     * As {@link #pagedSelect(String, ConsistencyLevel, List, int)}, but with the network page size
+     * named by the caller rather than fixed at {@link #PAGE_SIZE} -- see {@link #TAG_PAGE_SIZE} for
+     * why a DISTINCT partition-key scan cannot afford the default.
+     */
+    private static List<UntypedResultSet.Row> pagedSelect(String query, ConsistencyLevel cl, List<ByteBuffer> values,
+                                                          int maxRows, int pageSize)
+    {
         List<UntypedResultSet.Row> rows = new ArrayList<>();
         QueryState queryState = QueryState.forInternalCalls();
         PagingState pagingState = null;
         while (true)
         {
-            QueryOptions options = QueryOptions.create(cl, values, false, PAGE_SIZE, pagingState, null,
+            QueryOptions options = QueryOptions.create(cl, values, false, pageSize, pagingState, null,
                                                         ProtocolVersion.CURRENT, null);
             CQLStatement statement = QueryProcessor.instance.parse(query, queryState, options);
             ResultMessage result = QueryProcessor.instance.process(statement, queryState, options,
