@@ -24,7 +24,7 @@ variables:
   # modules/accord is a git submodule and is required by the build.
   GIT_SUBMODULE_STRATEGY: recursive
   GIT_SUBMODULE_DEPTH: 1
-  ANT_OPTS: "-Xmx4g"
+  ANT_OPTS: "-Xmx3g"   # 4g heap + metaspace/native exceeded the runner container cgroup during checkstyle (2,931 files) -> ant Killed; 3g leaves headroom on the smaller runners
 
 default:
   image: eclipse-temurin:21-jdk
