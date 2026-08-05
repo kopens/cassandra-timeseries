@@ -201,6 +201,24 @@ public final class TagRegistry
         if (seen.contains(tag))
             return;
 
+        // Past the cache's ceiling, stop registering from the write path altogether rather than
+        // registering without caching. The latter is what "bounded cache, unbounded correctness"
+        // naively suggests, and it is the worse failure by far: every single mutation to the table
+        // would issue its own distributed INSERT, forever -- at this node's write rate that converts
+        // a heap concern into a write-amplification outage. The hourly reconcile scan is the backstop
+        // that makes stopping safe: it is authoritative, and it is what covers every tag the write
+        // path never registered (see the class javadoc).
+        if (seen.size() >= MAX_CACHED_TAGS_PER_TABLE)
+        {
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, base.keyspace + '.' + base.name + ":tag-cache-full",
+                             1, TimeUnit.HOURS,
+                             "Tiered storage: {}.{} has more than {} distinct tags on this node; the write path has " +
+                             "stopped registering new ones and they will be picked up by the reconcile scan instead. " +
+                             "Enumeration for this table is back to costing a full base-table scan every {} minutes",
+                             base.keyspace, base.name, MAX_CACHED_TAGS_PER_TABLE, RECONCILE_INTERVAL_MINUTES);
+            return;
+        }
+
         TableMetadata registry = Schema.instance.getTableMetadata(base.keyspace, ChunkTables.tagsTableName(base.name));
         if (registry == null)
             return; // not ensured yet; the first cycle creates it and reconciles into it
@@ -219,15 +237,18 @@ public final class TagRegistry
         // empties this cache, so it is every tag's first write again). Claiming first bounds it to
         // one write per tag per node; the claim is released again below if the write fails, so a
         // failed registration is still retried by a later write rather than being cached as done.
-        boolean claimed = seen.size() < MAX_CACHED_TAGS_PER_TABLE && seen.add(tag);
+        // ...and losing the claim race means another thread is already registering this exact tag, so
+        // this one returns rather than issuing a duplicate. Checking `contains` above and then adding
+        // unconditionally would have let every racer through, which is the burst this exists to stop.
+        if (!seen.add(tag))
+            return;
         try
         {
             QueryProcessor.process(query, cl, values);
         }
         catch (RuntimeException e)
         {
-            if (claimed)
-                seen.remove(tag);
+            seen.remove(tag);
             NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, base.keyspace + '.' + base.name + ":tag-registry-write",
                              5, TimeUnit.MINUTES,
                              "Tiered storage: could not register a tag of {}.{}; it will be picked up by the next " +
