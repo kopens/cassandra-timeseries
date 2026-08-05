@@ -621,6 +621,39 @@ public class TieringPolicyTest
         assertNull(TieringPolicy.ttlShadowsHotWindowWarning(canonicalTable(null), policy));
     }
 
+    // ---- ttlWithoutColdWindowWarning ----
+
+    @Test
+    public void testTtlWithoutColdWindowWarns()
+    {
+        // The dangerous, silent, irreversible case: a table with real retention gets a tiering policy
+        // that names no cold_window. The re-encoder drops each row's TTL when it copies the value into
+        // a chunk (chunks carry none of their own) and then deletes the base row -- so 31 days of
+        // retention quietly becomes forever, with no un-tier to undo it.
+        TieringPolicy policy = TieringPolicy.parse("{\"hot_window\":\"3h\",\"chunk_window\":\"1h\"}");
+        String warning = TieringPolicy.ttlWithoutColdWindowWarning(tableWithTtl(2_678_400), policy);
+        assertNotNull(warning);
+        assertTrue(warning, warning.contains("2678400"));
+        assertTrue(warning, warning.contains("cold_window"));
+    }
+
+    @Test
+    public void testTtlWithColdWindowDoesNotWarn()
+    {
+        // cold_window is the supported way to express retention on a tiered table, so setting one is
+        // exactly the fix this warning asks for -- it must then go quiet.
+        TieringPolicy policy = TieringPolicy.parse("{\"hot_window\":\"3h\",\"cold_window\":\"31d\"}");
+        assertNull(TieringPolicy.ttlWithoutColdWindowWarning(tableWithTtl(2_678_400), policy));
+    }
+
+    @Test
+    public void testNoTtlWithoutColdWindowDoesNotWarn()
+    {
+        // Nothing was expiring in the first place, so nothing stops expiring.
+        TieringPolicy policy = TieringPolicy.parse("{\"hot_window\":\"3h\"}");
+        assertNull(TieringPolicy.ttlWithoutColdWindowWarning(canonicalTable(null), policy));
+    }
+
     // ---- fromTable ----
 
     @Test

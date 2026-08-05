@@ -300,8 +300,44 @@ public class TieredStorageService implements TieredStorageServiceMBean
      * coverage). So this cancels the schedule and gives a running cycle a bounded moment to notice,
      * rather than joining it.
      */
+    /**
+     * Set once, by {@link #stopSweeping}, and never cleared: the sweep is being torn down and no cycle
+     * should start new work.
+     * <p>
+     * Interruption alone is not enough to stop a cycle, which is what shipping only
+     * {@link #stopSweeping} taught: {@code shutdownNow} interrupts the sweep thread, but
+     * {@link #runOnceInner}'s per-tag handler catches every {@link RuntimeException} and moves to the
+     * next tag -- by design, so one bad tag cannot wedge a table. During shutdown every remaining tag
+     * then fails in turn, so the cycle ground through the whole backlog at shutdown speed and logged
+     * one ERROR per tag: thousands of lines in a few seconds, burying anything real and delaying the
+     * stop it was supposed to accelerate. The loops consult this instead, and stop.
+     */
+    private static volatile boolean sweepStopping = false;
+
+    /**
+     * Test-only seam for {@link #sweepStopping}. A test cannot provoke the real thing -- that needs a
+     * JVM shutdown -- and must restore the previous value, since this latch is process-wide and a
+     * leaked {@code true} would silently make every later test's cycle a no-op.
+     */
+    @VisibleForTesting
+    static boolean setSweepStoppingForTesting(boolean stopping)
+    {
+        boolean previous = sweepStopping;
+        sweepStopping = stopping;
+        return previous;
+    }
+
+    /** @return {@code true} once tiering is shutting down; see {@link #sweepStopping}. */
+    private static boolean stopRequested()
+    {
+        // sweepStopping, not just the interrupt flag: an interruptible call inside the cycle may
+        // consume and clear the interrupt before the loop gets to look at it.
+        return sweepStopping || Thread.currentThread().isInterrupted();
+    }
+
     private static void stopSweeping()
     {
+        sweepStopping = true;
         tieringExecutor.shutdown();
         try
         {
@@ -589,6 +625,15 @@ public class TieredStorageService implements TieredStorageServiceMBean
                              1, TimeUnit.HOURS, "{}", ttlWarning);
         }
 
+        String retentionWarning = TieringPolicy.ttlWithoutColdWindowWarning(base, policy);
+        if (retentionWarning != null)
+        {
+            // Same rate limit, same reason -- and this one names a consequence that cannot be undone
+            // once the base rows are gone, so it is worth a line an operator will actually see.
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, key(keyspace, table) + ":ttl-without-cold-window",
+                             1, TimeUnit.HOURS, "{}", retentionWarning);
+        }
+
         ChunkTables.ensureChunkTable(base);
         // Re-read the coverage ledger at the top of every cycle. This is also what warms it after a
         // restart -- the global sweep runs a cycle for every policy-bearing table -- so the read path
@@ -680,6 +725,14 @@ public class TieredStorageService implements TieredStorageServiceMBean
 
         for (List<ByteBuffer> tag : enumerateTags(base, tagCqlList, tagRawNames, baseRef, cl, stats, true))
         {
+            if (stopRequested())
+            {
+                logger.info("Tiered storage: {}.{} cycle stopped mid-run because tiering is shutting down; the " +
+                            "remaining tags are untouched and will be encoded on the next cycle after startup",
+                            keyspace, table);
+                break;
+            }
+
             // One tag's worth of trouble -- a corrupt existing chunk, a read/write timeout, anything --
             // must not wedge every other tag on this table out of being re-encoded for good.
             try
@@ -939,6 +992,16 @@ public class TieredStorageService implements TieredStorageServiceMBean
                 // encoded an arbitrary subset of the table. An availability failure must not be
                 // reported as success.
                 stats.tagsSkipped++;
+                if (stopRequested())
+                {
+                    // Not a fault worth a stack trace: everything fails once drain has taken the query
+                    // path apart, and reporting each one as its own incident is how a clean shutdown
+                    // produced thousands of ERROR lines.
+                    logger.info("Tiered storage runOnce: {}.{} abandoning the cycle at tag {} -- tiering is shutting " +
+                                "down. Its rows are untouched and will be encoded after startup",
+                                keyspace, table, describeTag(tagColumns, tag));
+                    break;
+                }
                 logger.error("Tiered storage runOnce: {}.{} failed while re-encoding tag {} -- skipping to the " +
                              "next tag; this tag will be retried next cycle", keyspace, table,
                              describeTag(tagColumns, tag), e);
@@ -963,6 +1026,8 @@ public class TieredStorageService implements TieredStorageServiceMBean
             {
                 for (List<ByteBuffer> tag : enumerateTags(chunkMeta, tagCqlList, tagRawNames, chunkRef, cl, stats, false))
                 {
+                    if (stopRequested())
+                        break; // same reason as the encode loop above; expiry resumes next cycle
                     try
                     {
                         List<ByteBuffer> coldValues = boundTo(
@@ -1153,17 +1218,39 @@ public class TieredStorageService implements TieredStorageServiceMBean
 
         long skippedBefore = stats.tagsSkipped;
         List<List<ByteBuffer>> scanned = scanTags(base, tagCqlList, tagRawNames, baseRef, cl, stats);
+        boolean complete = stats.tagsSkipped == skippedBefore;
 
         // Only a scan that covered every range may stand in for the base table. A partial one would
         // write a registry that omits the tags whose range failed, and the next cycles would read it
         // back as complete -- turning one cycle's transient read timeout into tags that are never
         // encoded again until the reconcile interval elapses.
-        if (registryBacked && stats.tagsSkipped == skippedBefore)
+        if (registryBacked && complete)
         {
             TagRegistry.putAll(base, cl, scanned);
             TagRegistry.reconciled(base);
+            return scanned;
         }
-        return scanned;
+
+        if (!registryBacked)
+            return scanned;
+
+        // The scan did not finish. Union what it did find with the registry rather than returning the
+        // partial result alone: on a table whose partitions are big enough that a DISTINCT scan cannot
+        // reliably complete -- which is precisely the table the registry exists for -- the scan never
+        // succeeds, so `reconciled` is never recorded, so this branch is taken on every single cycle.
+        // Returning only the partial scan there would mean the write path's registrations are never
+        // consulted at all, and the tags in whichever range keeps failing are never encoded. The
+        // registry cannot invent a tag that does not exist, so a union is only ever more complete.
+        List<List<ByteBuffer>> registered = TagRegistry.read(base, cl);
+        if (registered.isEmpty())
+            return scanned;
+
+        Set<List<ByteBuffer>> union = new LinkedHashSet<>(scanned);
+        union.addAll(restrictToPrimaryRanges(base, registered));
+        logger.info("Tiered storage: {}.{}'s tag scan was incomplete; falling back to the union of what it found " +
+                    "({}) and the registry, for {} tags this cycle", base.keyspace, base.name, scanned.size(),
+                    union.size());
+        return new ArrayList<>(union);
     }
 
     /**

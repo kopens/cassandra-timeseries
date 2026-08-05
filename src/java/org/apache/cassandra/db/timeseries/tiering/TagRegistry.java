@@ -201,6 +201,24 @@ public final class TagRegistry
         if (seen.contains(tag))
             return;
 
+        // Past the cache's ceiling, stop registering from the write path altogether rather than
+        // registering without caching. The latter is what "bounded cache, unbounded correctness"
+        // naively suggests, and it is the worse failure by far: every single mutation to the table
+        // would issue its own distributed INSERT, forever -- at this node's write rate that converts
+        // a heap concern into a write-amplification outage. The hourly reconcile scan is the backstop
+        // that makes stopping safe: it is authoritative, and it is what covers every tag the write
+        // path never registered (see the class javadoc).
+        if (seen.size() >= MAX_CACHED_TAGS_PER_TABLE)
+        {
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, base.keyspace + '.' + base.name + ":tag-cache-full",
+                             1, TimeUnit.HOURS,
+                             "Tiered storage: {}.{} has more than {} distinct tags on this node; the write path has " +
+                             "stopped registering new ones and they will be picked up by the reconcile scan instead. " +
+                             "Enumeration for this table is back to costing a full base-table scan every {} minutes",
+                             base.keyspace, base.name, MAX_CACHED_TAGS_PER_TABLE, RECONCILE_INTERVAL_MINUTES);
+            return;
+        }
+
         TableMetadata registry = Schema.instance.getTableMetadata(base.keyspace, ChunkTables.tagsTableName(base.name));
         if (registry == null)
             return; // not ensured yet; the first cycle creates it and reconciles into it
@@ -212,14 +230,25 @@ public final class TagRegistry
         List<ByteBuffer> values = new ArrayList<>(tag.size() + 1);
         values.add(scopeValue());
         values.addAll(tag);
+        // Claim the tag BEFORE issuing the write, not after. Every concurrent write to a
+        // newly-seen tag reaches this point, and marking it seen only on success meant all of them
+        // issued their own INSERT -- a burst of identical registrations proportional to the write
+        // concurrency, on the client's own write path, exactly when a table is warming up (a restart
+        // empties this cache, so it is every tag's first write again). Claiming first bounds it to
+        // one write per tag per node; the claim is released again below if the write fails, so a
+        // failed registration is still retried by a later write rather than being cached as done.
+        // ...and losing the claim race means another thread is already registering this exact tag, so
+        // this one returns rather than issuing a duplicate. Checking `contains` above and then adding
+        // unconditionally would have let every racer through, which is the burst this exists to stop.
+        if (!seen.add(tag))
+            return;
         try
         {
             QueryProcessor.process(query, cl, values);
-            if (seen.size() < MAX_CACHED_TAGS_PER_TABLE)
-                seen.add(tag);
         }
         catch (RuntimeException e)
         {
+            seen.remove(tag);
             NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, base.keyspace + '.' + base.name + ":tag-registry-write",
                              5, TimeUnit.MINUTES,
                              "Tiered storage: could not register a tag of {}.{}; it will be picked up by the next " +
@@ -239,11 +268,20 @@ public final class TagRegistry
      */
     static void noteTagIfTiered(TableMetadata base, org.apache.cassandra.db.DecoratedKey key)
     {
-        List<ByteBuffer> tag = tagOf(base, key);
         Set<List<ByteBuffer>> seen = seenTags.get(base.id);
-        if (seen != null && seen.contains(tag))
-            return;
+        List<ByteBuffer> tag = null;
+        if (seen != null)
+        {
+            tag = tagOf(base, key);
+            if (seen.contains(tag))
+                return; // the overwhelmingly common case: known table, known tag
+        }
 
+        // Deliberately after the cache probe and before {@link #tagOf}: this is the path taken by
+        // every write to every NON-tiered table that happens to be clustered by a timestamp, on every
+        // write forever, and fromTable resolves that to a single extensions-map lookup returning null.
+        // Building the tag first (as this once did) put a List allocation -- and, on a composite
+        // partition key, a CompositeType.split and array copy -- on that path for no reason at all.
         TieringPolicy policy;
         try
         {
@@ -256,7 +294,7 @@ public final class TagRegistry
         if (policy == null)
             return;
 
-        noteTag(base, policy.consistency, tag);
+        noteTag(base, policy.consistency, tag == null ? tagOf(base, key) : tag);
     }
 
     /** @return {@code key}'s partition-key column values, in the base table's key order. */
