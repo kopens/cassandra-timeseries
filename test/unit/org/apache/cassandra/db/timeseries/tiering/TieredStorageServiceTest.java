@@ -754,6 +754,36 @@ public class TieredStorageServiceTest extends CQLTester
     }
 
     @Test
+    public void sweepSpacesRetriesOfAFailedTableByItsInterval() throws Throwable
+    {
+        // Regression for a production incident: the sweep gated on the last *completed* run, so a
+        // table whose run always throws never recorded a timestamp, was permanently "never run", and
+        // was therefore re-attempted on every 60s tick regardless of its own (here: 1h) interval. The
+        // failure that provoked it was a read timeout on a full-table DISTINCT scan, so each retry
+        // was also the most expensive thing the cycle can do -- a failing table generating the load
+        // that kept it failing. Attempts, not completions, are what the interval spaces out.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\",\"interval\":\"1h\"}");
+
+        TieredStorageService service = new TieredStorageService(); // fresh instance: the table is due
+        int[] attempts = { 0 };
+        service.preRunHookForTesting = (ks, table) ->
+        {
+            attempts[0]++;
+            throw new RuntimeException("injected failure for " + ks + '.' + table);
+        };
+
+        service.sweep();
+        service.sweep(); // second tick, well inside the 1h interval
+
+        assertEquals("a failed run must still count as an attempt, so the interval spaces the retry",
+                     1, attempts[0]);
+        // The failure is still not a completion: status keeps reporting "never successfully run".
+        assertNull(service.lastRunAtMillis(KEYSPACE, currentTable()));
+        assertNull(service.lastStats(KEYSPACE, currentTable()));
+    }
+
+    @Test
     public void reentryGuardRejectsConcurrentRun() throws Throwable
     {
         createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
