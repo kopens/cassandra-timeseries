@@ -91,7 +91,10 @@ public final class TieredWrites
 
         for (IMutation mutation : mutations)
             for (PartitionUpdate update : mutation.getPartitionUpdates())
+            {
+                noteTag(update);
                 guard(update);
+            }
     }
 
     /**
@@ -104,7 +107,22 @@ public final class TieredWrites
     {
         if (TransparentReads.inInternalBypass())
             return;
+        noteTag(update);
         guard(update);
+    }
+
+    /**
+     * Registers the update's tag with {@link TagRegistry} on the way past, so the re-encoder can
+     * enumerate tags from a small shadow table instead of {@code SELECT DISTINCT}-ing the base table
+     * every cycle. Gated on the same free clustering-shape check {@link #guard} opens with, so a
+     * write to a table that was never a candidate for tiering pays nothing new at all.
+     */
+    private static void noteTag(PartitionUpdate update)
+    {
+        TableMetadata metadata = update.metadata();
+        if (!ColdBoundary.hasTimestampClustering(metadata))
+            return;
+        TagRegistry.noteTagIfTiered(metadata, update.partitionKey());
     }
 
     private static void guard(PartitionUpdate update)

@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.db.timeseries.tiering;
 
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -125,6 +126,80 @@ public final class ChunkTables
     public static String coverageTableName(String baseTable)
     {
         return baseTable + "__chunk_coverage";
+    }
+
+    /**
+     * @return the tag-registry table name for {@code baseTable}, e.g. {@code "metrics__tags"} -- see
+     * {@link TagRegistry} for what it holds and why enumerating tags from the base table does not
+     * scale.
+     */
+    public static String tagsTableName(String baseTable)
+    {
+        return baseTable + "__tags";
+    }
+
+    /**
+     * @return the name for the registry's single-valued partition key, {@code "scope"} unless
+     * {@code base} already has a partition key column of that name, in which case it is prefixed
+     * with underscores until it does not collide. The registry's partition key is a constant and its
+     * clustering is the base table's whole partition key, so the two namespaces meet in one table.
+     */
+    static String tagsScopeColumn(TableMetadata base)
+    {
+        Set<String> taken = new HashSet<>();
+        for (ColumnMetadata column : base.partitionKeyColumns())
+            taken.add(column.name.toString());
+
+        String name = TagRegistry.SCOPE_COLUMN;
+        while (taken.contains(name))
+            name = '_' + name;
+        return name;
+    }
+
+    /**
+     * Builds the (not-yet-registered) {@link TableMetadata} for {@code base}'s tag registry:
+     * {@code PRIMARY KEY ((scope), <base's whole partition key>)} -- one constant partition whose
+     * clustering rows are the distinct tags of the base table.
+     * <p>
+     * One partition, like {@link #coverageTableMetadata}, because the point is to make enumeration a
+     * <em>clustering</em> scan: reading N sorted rows out of one partition is the cheap shape, where
+     * the {@code SELECT DISTINCT} over the base table it replaces pays a first-live-row seek per
+     * partition across every SSTable in range. Registry writes are one per tag ever seen, not one per
+     * base write (see {@link TagRegistry#noteTag}), so the single partition takes no meaningful write
+     * load.
+     */
+    public static TableMetadata tagsTableMetadata(TableMetadata base)
+    {
+        TableMetadata.Builder builder = TableMetadata.builder(base.keyspace, tagsTableName(base.name))
+                                                     .addPartitionKeyColumn(tagsScopeColumn(base), UTF8Type.instance);
+        for (ColumnMetadata column : base.partitionKeyColumns())
+            builder.addClusteringColumn(column.name, column.type);
+        return builder.build();
+    }
+
+    /** Renders {@link #tagsTableMetadata} as the {@code CREATE TABLE IF NOT EXISTS} DDL. */
+    public static String createTagsTableStatement(TableMetadata base)
+    {
+        TableMetadata tags = tagsTableMetadata(base);
+
+        CqlBuilder builder = new CqlBuilder(256);
+        builder.append("CREATE TABLE IF NOT EXISTS ")
+               .appendQuotingIfNeeded(tags.keyspace)
+               .append('.')
+               .appendQuotingIfNeeded(tags.name)
+               .append(" (");
+
+        for (ColumnMetadata column : tags.partitionKeyColumns())
+            appendColumnDefinition(builder, column);
+        for (ColumnMetadata column : tags.clusteringColumns())
+            appendColumnDefinition(builder, column);
+
+        builder.append("PRIMARY KEY ((")
+               .append(tags.partitionKeyColumns().get(0).name)
+               .append(')');
+        for (ColumnMetadata column : tags.clusteringColumns())
+            builder.append(", ").append(column.name);
+        return builder.append("))").toString();
     }
 
     /**
@@ -313,6 +388,9 @@ public final class ChunkTables
         // the very first thing the cycle does after this is claim coverage into it, and a replica that
         // has not seen it yet answers that write with INCOMPATIBLE_SCHEMA.
         QueryProcessor.process(createCoverageTableStatement(base), ConsistencyLevel.ONE);
+        // Same breath, same reason: the cycle's first act after this is to read the registry to find
+        // out which tags to encode at all.
+        QueryProcessor.process(createTagsTableStatement(base), ConsistencyLevel.ONE);
         awaitClusterWideVisibility(base.keyspace, chunkTableName(base.name));
     }
 
