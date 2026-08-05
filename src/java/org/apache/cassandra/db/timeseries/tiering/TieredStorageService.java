@@ -300,8 +300,44 @@ public class TieredStorageService implements TieredStorageServiceMBean
      * coverage). So this cancels the schedule and gives a running cycle a bounded moment to notice,
      * rather than joining it.
      */
+    /**
+     * Set once, by {@link #stopSweeping}, and never cleared: the sweep is being torn down and no cycle
+     * should start new work.
+     * <p>
+     * Interruption alone is not enough to stop a cycle, which is what shipping only
+     * {@link #stopSweeping} taught: {@code shutdownNow} interrupts the sweep thread, but
+     * {@link #runOnceInner}'s per-tag handler catches every {@link RuntimeException} and moves to the
+     * next tag -- by design, so one bad tag cannot wedge a table. During shutdown every remaining tag
+     * then fails in turn, so the cycle ground through the whole backlog at shutdown speed and logged
+     * one ERROR per tag: thousands of lines in a few seconds, burying anything real and delaying the
+     * stop it was supposed to accelerate. The loops consult this instead, and stop.
+     */
+    private static volatile boolean sweepStopping = false;
+
+    /**
+     * Test-only seam for {@link #sweepStopping}. A test cannot provoke the real thing -- that needs a
+     * JVM shutdown -- and must restore the previous value, since this latch is process-wide and a
+     * leaked {@code true} would silently make every later test's cycle a no-op.
+     */
+    @VisibleForTesting
+    static boolean setSweepStoppingForTesting(boolean stopping)
+    {
+        boolean previous = sweepStopping;
+        sweepStopping = stopping;
+        return previous;
+    }
+
+    /** @return {@code true} once tiering is shutting down; see {@link #sweepStopping}. */
+    private static boolean stopRequested()
+    {
+        // sweepStopping, not just the interrupt flag: an interruptible call inside the cycle may
+        // consume and clear the interrupt before the loop gets to look at it.
+        return sweepStopping || Thread.currentThread().isInterrupted();
+    }
+
     private static void stopSweeping()
     {
+        sweepStopping = true;
         tieringExecutor.shutdown();
         try
         {
@@ -689,6 +725,14 @@ public class TieredStorageService implements TieredStorageServiceMBean
 
         for (List<ByteBuffer> tag : enumerateTags(base, tagCqlList, tagRawNames, baseRef, cl, stats, true))
         {
+            if (stopRequested())
+            {
+                logger.info("Tiered storage: {}.{} cycle stopped mid-run because tiering is shutting down; the " +
+                            "remaining tags are untouched and will be encoded on the next cycle after startup",
+                            keyspace, table);
+                break;
+            }
+
             // One tag's worth of trouble -- a corrupt existing chunk, a read/write timeout, anything --
             // must not wedge every other tag on this table out of being re-encoded for good.
             try
@@ -948,6 +992,16 @@ public class TieredStorageService implements TieredStorageServiceMBean
                 // encoded an arbitrary subset of the table. An availability failure must not be
                 // reported as success.
                 stats.tagsSkipped++;
+                if (stopRequested())
+                {
+                    // Not a fault worth a stack trace: everything fails once drain has taken the query
+                    // path apart, and reporting each one as its own incident is how a clean shutdown
+                    // produced thousands of ERROR lines.
+                    logger.info("Tiered storage runOnce: {}.{} abandoning the cycle at tag {} -- tiering is shutting " +
+                                "down. Its rows are untouched and will be encoded after startup",
+                                keyspace, table, describeTag(tagColumns, tag));
+                    break;
+                }
                 logger.error("Tiered storage runOnce: {}.{} failed while re-encoding tag {} -- skipping to the " +
                              "next tag; this tag will be retried next cycle", keyspace, table,
                              describeTag(tagColumns, tag), e);
@@ -972,6 +1026,8 @@ public class TieredStorageService implements TieredStorageServiceMBean
             {
                 for (List<ByteBuffer> tag : enumerateTags(chunkMeta, tagCqlList, tagRawNames, chunkRef, cl, stats, false))
                 {
+                    if (stopRequested())
+                        break; // same reason as the encode loop above; expiry resumes next cycle
                     try
                     {
                         List<ByteBuffer> coldValues = boundTo(

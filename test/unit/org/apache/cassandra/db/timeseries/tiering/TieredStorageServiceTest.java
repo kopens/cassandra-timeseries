@@ -757,6 +757,52 @@ public class TieredStorageServiceTest extends CQLTester
     }
 
     @Test
+    public void shutdownStopsTheCycleInsteadOfGrindingThroughEveryTag() throws Throwable
+    {
+        // Regression for what the first shutdown-hook deploy actually did in production. Cancelling
+        // the sweep interrupts its thread, but runOnce's per-tag handler catches every RuntimeException
+        // and moves on -- by design, so one bad tag cannot wedge a table. During shutdown EVERY
+        // remaining tag fails, so the cycle walked the entire backlog at shutdown speed and logged one
+        // ERROR per tag: thousands of lines in seconds, burying anything real. The cycle must notice it
+        // is stopping and leave, quietly.
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        long wt = 1;
+        for (int t = 0; t < 5; t++)
+            for (int r = 0; r < 4; r++)
+                insertRow("tag" + t, r * 600_000L, r, wt++);
+
+        Logger serviceLogger = (Logger) LoggerFactory.getLogger(TieredStorageService.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        serviceLogger.addAppender(appender);
+
+        TierRunStats stats;
+        boolean previous = TieredStorageService.setSweepStoppingForTesting(true);
+        try
+        {
+            stats = new TieredStorageService().runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+        }
+        finally
+        {
+            TieredStorageService.setSweepStoppingForTesting(previous);
+            serviceLogger.detachAppender(appender);
+        }
+
+        // Nothing was encoded, and -- the point of the fix -- nothing was logged as a failure.
+        assertEquals(0, stats.windowsEncoded);
+        assertFalse("shutdown must not report per-tag failures as errors",
+                    appender.list.stream().anyMatch(e -> e.getLevel() == Level.ERROR));
+        assertTrue("the cycle should say once that it stopped because tiering is shutting down",
+                   appender.list.stream().anyMatch(e -> e.getFormattedMessage().contains("shutting down")));
+
+        // And it left the data alone: every source row is still there for the next startup to encode.
+        for (int t = 0; t < 5; t++)
+            assertEquals(4, raw("SELECT * FROM %s WHERE tag = ?", "tag" + t).size());
+    }
+
+    @Test
     public void tagRegistryIsPopulatedAndThenDrivesEnumeration() throws Throwable
     {
         // The registry exists so the steady-state cycle stops paying for SELECT DISTINCT over the
