@@ -18,8 +18,11 @@
 package org.apache.cassandra.db.timeseries.tiering;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.Random;
+import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 
@@ -751,6 +754,53 @@ public class TieredStorageServiceTest extends CQLTester
         assertNotNull("the second table's run must survive the first table's failure",
                       service.lastRunAtMillis(KEYSPACE, goodTable));
         assertNotNull(service.lastStats(KEYSPACE, goodTable));
+    }
+
+    @Test
+    public void tagRegistryIsPopulatedAndThenDrivesEnumeration() throws Throwable
+    {
+        // The registry exists so the steady-state cycle stops paying for SELECT DISTINCT over the
+        // base table (~19ms per partition on the production table this was built for -- ~220s a
+        // cycle against a 300s interval). Two things have to hold for that to be safe: the first
+        // cycle's authoritative base-table scan must be written into the registry, and a later cycle
+        // reading the registry instead must enumerate exactly the same tags -- encoding new closed
+        // windows for them just as the scan would have.
+        TagRegistry.resetForTesting();
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        String[] tags = { "a", "b", "c" };
+        long wt = 1;
+        for (String tag : tags)
+            for (int r = 0; r < 4; r++)
+                insertRow(tag, r * 600_000L, r, wt++); // window 0
+
+        TieredStorageService service = new TieredStorageService();
+        TierRunStats first = service.runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+        assertEquals(3, first.windowsEncoded);
+        assertEquals(0, first.tagsSkipped);
+
+        // The scan's result was persisted -- one clustering row per tag, in one partition.
+        UntypedResultSet registered = execute(String.format("SELECT tag FROM %s.%s WHERE scope = 'tags'",
+                                                            KEYSPACE, ChunkTables.tagsTableName(currentTable())));
+        assertEquals(3, registered.size());
+        Set<String> registeredTags = new HashSet<>();
+        for (UntypedResultSet.Row row : registered)
+            registeredTags.add(row.getString("tag"));
+        assertEquals(new HashSet<>(Arrays.asList(tags)), registeredTags);
+
+        // Second cycle: the reconcile interval has not elapsed, so enumeration comes from the
+        // registry. New closed windows for the same tags must still be found and encoded.
+        for (String tag : tags)
+            for (int r = 0; r < 4; r++)
+                insertRow(tag, HOUR + r * 600_000L, r, wt++); // window 1
+
+        TierRunStats second = service.runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+        assertEquals("the registry-backed cycle must find every tag the scan would have",
+                     3, second.windowsEncoded);
+        assertEquals(0, second.tagsSkipped);
+        for (String tag : tags)
+            assertEquals(1, execute(chunkSelectQuery(), tag, new Date(HOUR)).size());
     }
 
     @Test

@@ -166,6 +166,9 @@ public class TieredStorageService implements TieredStorageServiceMBean
     /** Fixed delay between global sweep ticks; each policy-bearing table is still gated by its own {@code interval}. */
     private static final long SWEEP_DELAY_SECONDS = 60;
 
+    /** How long {@link #stopSweeping} lets an in-flight cycle finish before abandoning it. */
+    private static final long SHUTDOWN_GRACE_SECONDS = 10;
+
     /** Process-wide singleton wired up by {@link org.apache.cassandra.service.CassandraDaemon#setup()} via {@link #setup}. */
     public static final TieredStorageService instance = new TieredStorageService();
 
@@ -252,6 +255,10 @@ public class TieredStorageService implements TieredStorageServiceMBean
      * unrelated periodic jobs behind it. Non-periodic on shutdown, like {@code optionalTasks}: an
      * in-flight cycle has nothing that must complete (it claims coverage before it writes, so an
      * interrupted cycle only over-states coverage) and draining must not wait for one.
+     * <p>
+     * Because it is this class's own executor rather than a shared one, it is also this class's job
+     * to stop it -- see {@link #stopSweeping}, registered as a pre-shutdown hook by {@link #setup}.
+     * Nothing else will.
      */
     private static final ScheduledExecutorPlus tieringExecutor =
         ExecutorFactory.Global.executorFactory().scheduled(false, "TieredStorage");
@@ -273,6 +280,44 @@ public class TieredStorageService implements TieredStorageServiceMBean
 
         MBeanWrapper.instance.registerMBean(this, MBEAN_NAME);
         tieringExecutor.scheduleWithFixedDelay(this::sweep, SWEEP_DELAY_SECONDS, SWEEP_DELAY_SECONDS, TimeUnit.SECONDS);
+        StorageService.instance.addPreShutdownHook(TieredStorageService::stopSweeping);
+    }
+
+    /**
+     * Stops the sweep loop, as the <b>first</b> thing {@link StorageService#drain} does (it runs the
+     * pre-shutdown hooks before it touches anything else).
+     * <p>
+     * Registering this is not optional bookkeeping -- without it nothing ever shut
+     * {@link #tieringExecutor} down, and {@code nodetool stopdaemon} did not stop the node. The
+     * observed failure: the native transport closed (port 9042 gone, so every client saw the node as
+     * down) and then the process ran on indefinitely, the sweep still issuing distributed reads,
+     * chunk inserts and range deletes minute after minute against a node that drain was in the middle
+     * of dismantling -- MessagingService shut down, mutating stages shut down, column families being
+     * flushed. Recovery took a {@code kill -9}.
+     * <p>
+     * Draining still must not <em>wait</em> for an in-flight cycle: one has nothing that must
+     * complete (it claims coverage before it writes, so an interrupted cycle only over-states
+     * coverage). So this cancels the schedule and gives a running cycle a bounded moment to notice,
+     * rather than joining it.
+     */
+    private static void stopSweeping()
+    {
+        tieringExecutor.shutdown();
+        try
+        {
+            if (!tieringExecutor.awaitTermination(SHUTDOWN_GRACE_SECONDS, TimeUnit.SECONDS))
+            {
+                logger.info("Tiered storage: a re-encode cycle was still running {}s into shutdown; abandoning it " +
+                            "(nothing it had not finished needs to complete -- coverage is claimed before a chunk " +
+                            "is written, so an interrupted cycle only over-states coverage)", SHUTDOWN_GRACE_SECONDS);
+                tieringExecutor.shutdownNow();
+            }
+        }
+        catch (InterruptedException e)
+        {
+            Thread.currentThread().interrupt();
+            tieringExecutor.shutdownNow();
+        }
     }
 
     /**
@@ -633,7 +678,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
                                            chunkRef, tagPredicate);
         String deleteExpiredQuery = format("DELETE FROM %s WHERE %s AND window_start < ?", chunkRef, tagPredicate);
 
-        for (List<ByteBuffer> tag : enumerateTags(base, tagCqlList, tagRawNames, baseRef, cl, stats))
+        for (List<ByteBuffer> tag : enumerateTags(base, tagCqlList, tagRawNames, baseRef, cl, stats, true))
         {
             // One tag's worth of trouble -- a corrupt existing chunk, a read/write timeout, anything --
             // must not wedge every other tag on this table out of being re-encoded for good.
@@ -916,7 +961,7 @@ public class TieredStorageService implements TieredStorageServiceMBean
             TableMetadata chunkMeta = Schema.instance.getTableMetadata(keyspace, ChunkTables.chunkTableName(table));
             if (chunkMeta != null)
             {
-                for (List<ByteBuffer> tag : enumerateTags(chunkMeta, tagCqlList, tagRawNames, chunkRef, cl, stats))
+                for (List<ByteBuffer> tag : enumerateTags(chunkMeta, tagCqlList, tagRawNames, chunkRef, cl, stats, false))
                 {
                     try
                     {
@@ -1094,7 +1139,71 @@ public class TieredStorageService implements TieredStorageServiceMBean
      * nothing -- this falls back to an unrestricted scan of every tag.
      */
     private static List<List<ByteBuffer>> enumerateTags(TableMetadata base, String tagCqlList, List<String> tagRawNames,
-                                                        String baseRef, ConsistencyLevel cl, TierRunStats stats)
+                                                        String baseRef, ConsistencyLevel cl, TierRunStats stats,
+                                                        boolean registryBacked)
+    {
+        if (registryBacked && !TagRegistry.dueForReconcile(base))
+        {
+            List<List<ByteBuffer>> registered = TagRegistry.read(base, cl);
+            // Empty is not "this table has no tags", it is "the registry cannot answer" (missing,
+            // unreadable, or not yet reconciled) -- fall through to the scan, which is always right.
+            if (!registered.isEmpty())
+                return restrictToPrimaryRanges(base, registered);
+        }
+
+        long skippedBefore = stats.tagsSkipped;
+        List<List<ByteBuffer>> scanned = scanTags(base, tagCqlList, tagRawNames, baseRef, cl, stats);
+
+        // Only a scan that covered every range may stand in for the base table. A partial one would
+        // write a registry that omits the tags whose range failed, and the next cycles would read it
+        // back as complete -- turning one cycle's transient read timeout into tags that are never
+        // encoded again until the reconcile interval elapses.
+        if (registryBacked && stats.tagsSkipped == skippedBefore)
+        {
+            TagRegistry.putAll(base, cl, scanned);
+            TagRegistry.reconciled(base);
+        }
+        return scanned;
+    }
+
+    /**
+     * Narrows {@code tags} to those whose token falls in one of this node's primary ranges -- the
+     * registry is a single partition holding every node's tags, so the partitioning the scan path
+     * gets from its {@code token(...)} predicate has to be applied here instead.
+     * <p>
+     * If this node reports no primary ranges at all, every tag is returned rather than none, matching
+     * {@link #scanTags}'s handling of the same (not-supposed-to-happen) state: redundant re-encoding
+     * across nodes is wasteful, silently tiering nothing is a bug.
+     */
+    private static List<List<ByteBuffer>> restrictToPrimaryRanges(TableMetadata base, List<List<ByteBuffer>> tags)
+    {
+        Collection<Range<Token>> primaryRanges = StorageService.instance.getPrimaryRanges(base.keyspace);
+        if (primaryRanges.isEmpty())
+        {
+            logger.warn("Tiered storage: {}.{} has no local primary ranges reported for this node; re-encoding every " +
+                        "registered tag rather than silently skipping data", base.keyspace, base.name);
+            return tags;
+        }
+
+        List<List<ByteBuffer>> mine = new ArrayList<>(tags.size());
+        for (List<ByteBuffer> tag : tags)
+        {
+            Token token = base.partitioner.getToken(TagRegistry.partitionKey(base, tag));
+            for (Range<Token> range : primaryRanges)
+            {
+                if (range.contains(token))
+                {
+                    mine.add(tag);
+                    break;
+                }
+            }
+        }
+        return mine;
+    }
+
+    /** The base-table {@code SELECT DISTINCT} enumeration -- authoritative, and the expensive one. */
+    private static List<List<ByteBuffer>> scanTags(TableMetadata base, String tagCqlList, List<String> tagRawNames,
+                                                   String baseRef, ConsistencyLevel cl, TierRunStats stats)
     {
         // LinkedHashSet of List<ByteBuffer>: List's equals/hashCode are the element-wise ones, so a
         // composite key deduplicates on all of its columns, not on identity.
