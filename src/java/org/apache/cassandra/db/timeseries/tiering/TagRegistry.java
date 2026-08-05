@@ -107,8 +107,20 @@ public final class TagRegistry
     private static final ConcurrentHashMap<TableId, Set<List<ByteBuffer>>> seenTags = new ConcurrentHashMap<>();
     private static final int MAX_CACHED_TAGS_PER_TABLE = 1_000_000;
 
-    /** {@link TableId} -> epoch millis of the last completed reconcile against the base table. */
-    private static final ConcurrentHashMap<TableId, Long> lastReconcileMillis = new ConcurrentHashMap<>();
+    /**
+     * {@link TableId} -> epoch millis of the last reconcile <b>attempt</b> against the base table,
+     * whether or not the scan completed.
+     * <p>
+     * Attempts, not successes. Gating on success is the same mistake that made a failing table's
+     * sweep ignore its own interval (see {@code TieredStorageService.lastAttemptAtMillisByTable}),
+     * and it reappeared here with the same shape: on the table this registry exists for, the base
+     * scan is exactly the thing that does not reliably finish, so a success-gated timer never
+     * advances and <em>every</em> cycle re-runs a multi-minute failing full-table scan instead of one
+     * per hour. Observed in production at 19-minute intervals against a 60-minute setting. Throttling
+     * failed attempts costs nothing: an incomplete scan's results are already unioned with the
+     * registry, and the write path keeps the registry current between reconciles.
+     */
+    private static final ConcurrentHashMap<TableId, Long> lastReconcileAttemptMillis = new ConcurrentHashMap<>();
 
     private TagRegistry()
     {
@@ -121,22 +133,25 @@ public final class TagRegistry
      */
     static boolean dueForReconcile(TableMetadata base)
     {
-        Long last = lastReconcileMillis.get(base.id);
+        Long last = lastReconcileAttemptMillis.get(base.id);
         return last == null
                || Clock.Global.currentTimeMillis() - last >= TimeUnit.MINUTES.toMillis(RECONCILE_INTERVAL_MINUTES);
     }
 
-    /** Records that {@code base}'s registry has just been rebuilt from the base table. */
-    static void reconciled(TableMetadata base)
+    /**
+     * Records that {@code base}'s registry reconcile was attempted -- called on every attempt, not
+     * only the ones that finished. See {@link #lastReconcileAttemptMillis} for why.
+     */
+    static void reconcileAttempted(TableMetadata base)
     {
-        lastReconcileMillis.put(base.id, Clock.Global.currentTimeMillis());
+        lastReconcileAttemptMillis.put(base.id, Clock.Global.currentTimeMillis());
     }
 
     @VisibleForTesting
     static void resetForTesting()
     {
         seenTags.clear();
-        lastReconcileMillis.clear();
+        lastReconcileAttemptMillis.clear();
     }
 
     /**

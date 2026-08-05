@@ -1224,15 +1224,19 @@ public class TieredStorageService implements TieredStorageServiceMBean
         // write a registry that omits the tags whose range failed, and the next cycles would read it
         // back as complete -- turning one cycle's transient read timeout into tags that are never
         // encoded again until the reconcile interval elapses.
-        if (registryBacked && complete)
-        {
-            TagRegistry.putAll(base, cl, scanned);
-            TagRegistry.reconciled(base);
-            return scanned;
-        }
-
         if (!registryBacked)
             return scanned;
+
+        // Every attempt resets the reconcile timer, complete or not -- otherwise a scan that never
+        // finishes is retried by every cycle rather than once an interval. See
+        // TagRegistry.lastReconcileAttemptMillis.
+        TagRegistry.reconcileAttempted(base);
+
+        if (complete)
+        {
+            TagRegistry.putAll(base, cl, scanned);
+            return scanned;
+        }
 
         // The scan did not finish. Union what it did find with the registry rather than returning the
         // partial result alone: on a table whose partitions are big enough that a DISTINCT scan cannot
