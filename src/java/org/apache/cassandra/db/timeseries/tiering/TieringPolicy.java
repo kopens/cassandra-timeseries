@@ -488,6 +488,42 @@ public final class TieringPolicy
                        TimeUnit.MILLISECONDS.toSeconds(policy.hotWindowMillis));
     }
 
+    /**
+     * @return a warning if {@code metadata} has a finite {@code default_time_to_live} but {@code policy}
+     * sets no {@code cold_window}, else {@code null}.
+     *
+     * <p>Tiering silently converts such a table from bounded retention to unbounded growth, and does it
+     * irreversibly. The chunk table deliberately does <b>not</b> inherit the base table's TTL (see
+     * {@link ChunkTables#createChunkTableStatement} -- a chunk written today holding month-old rows
+     * must not expire on today's schedule), and the re-encoder's chunk insert carries {@code USING
+     * TIMESTAMP} but no {@code USING TTL}, so a row's TTL is dropped the moment its value is copied
+     * into a chunk. Every row the re-encoder touches therefore stops expiring, while its base copy is
+     * deleted -- so the data is not lost, it is kept <em>forever</em>, and there is no un-tier to
+     * undo it with.
+     *
+     * <p>{@code cold_window} is the supported way to express retention on a tiered table, which is why
+     * this is a warning about a missing setting rather than a refusal: dropping TTL is legitimate when
+     * it is what the operator wants (raising the base TTL to a decade and tiering is a reasonable way
+     * to keep a decade of history compressed). It must just not happen by accident, which is exactly
+     * what it did before this check existed -- the pre-existing
+     * {@link #ttlShadowsHotWindowWarning} covers only the opposite direction, a TTL so short that
+     * rows expire before tiering can reach them.
+     */
+    public static String ttlWithoutColdWindowWarning(TableMetadata metadata, TieringPolicy policy)
+    {
+        long ttlSeconds = metadata.params.defaultTimeToLive;
+        if (ttlSeconds <= 0 || policy.coldWindowMillis >= 0)
+            return null;
+
+        return format("%s.%s has default_time_to_live = %ds but its timeseries_tiering policy sets no cold_window: " +
+                       "the re-encoder drops a row's TTL when it copies the value into a chunk (chunks carry no TTL " +
+                       "of their own), so every window it encodes stops expiring and this table's data is kept " +
+                       "forever rather than for %ds. This cannot be undone once the base rows are deleted. Set " +
+                       "cold_window to the retention you want, or raise/clear default_time_to_live if keeping " +
+                       "everything is intended",
+                       metadata.keyspace, metadata.name, ttlSeconds, ttlSeconds);
+    }
+
     @Override
     public String toString()
     {

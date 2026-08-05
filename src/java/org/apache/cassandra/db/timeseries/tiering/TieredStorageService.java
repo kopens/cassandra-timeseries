@@ -589,6 +589,15 @@ public class TieredStorageService implements TieredStorageServiceMBean
                              1, TimeUnit.HOURS, "{}", ttlWarning);
         }
 
+        String retentionWarning = TieringPolicy.ttlWithoutColdWindowWarning(base, policy);
+        if (retentionWarning != null)
+        {
+            // Same rate limit, same reason -- and this one names a consequence that cannot be undone
+            // once the base rows are gone, so it is worth a line an operator will actually see.
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, key(keyspace, table) + ":ttl-without-cold-window",
+                             1, TimeUnit.HOURS, "{}", retentionWarning);
+        }
+
         ChunkTables.ensureChunkTable(base);
         // Re-read the coverage ledger at the top of every cycle. This is also what warms it after a
         // restart -- the global sweep runs a cycle for every policy-bearing table -- so the read path
@@ -1153,17 +1162,39 @@ public class TieredStorageService implements TieredStorageServiceMBean
 
         long skippedBefore = stats.tagsSkipped;
         List<List<ByteBuffer>> scanned = scanTags(base, tagCqlList, tagRawNames, baseRef, cl, stats);
+        boolean complete = stats.tagsSkipped == skippedBefore;
 
         // Only a scan that covered every range may stand in for the base table. A partial one would
         // write a registry that omits the tags whose range failed, and the next cycles would read it
         // back as complete -- turning one cycle's transient read timeout into tags that are never
         // encoded again until the reconcile interval elapses.
-        if (registryBacked && stats.tagsSkipped == skippedBefore)
+        if (registryBacked && complete)
         {
             TagRegistry.putAll(base, cl, scanned);
             TagRegistry.reconciled(base);
+            return scanned;
         }
-        return scanned;
+
+        if (!registryBacked)
+            return scanned;
+
+        // The scan did not finish. Union what it did find with the registry rather than returning the
+        // partial result alone: on a table whose partitions are big enough that a DISTINCT scan cannot
+        // reliably complete -- which is precisely the table the registry exists for -- the scan never
+        // succeeds, so `reconciled` is never recorded, so this branch is taken on every single cycle.
+        // Returning only the partial scan there would mean the write path's registrations are never
+        // consulted at all, and the tags in whichever range keeps failing are never encoded. The
+        // registry cannot invent a tag that does not exist, so a union is only ever more complete.
+        List<List<ByteBuffer>> registered = TagRegistry.read(base, cl);
+        if (registered.isEmpty())
+            return scanned;
+
+        Set<List<ByteBuffer>> union = new LinkedHashSet<>(scanned);
+        union.addAll(restrictToPrimaryRanges(base, registered));
+        logger.info("Tiered storage: {}.{}'s tag scan was incomplete; falling back to the union of what it found " +
+                    "({}) and the registry, for {} tags this cycle", base.keyspace, base.name, scanned.size(),
+                    union.size());
+        return new ArrayList<>(union);
     }
 
     /**

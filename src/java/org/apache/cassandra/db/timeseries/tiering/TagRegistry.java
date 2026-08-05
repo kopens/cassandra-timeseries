@@ -212,14 +212,22 @@ public final class TagRegistry
         List<ByteBuffer> values = new ArrayList<>(tag.size() + 1);
         values.add(scopeValue());
         values.addAll(tag);
+        // Claim the tag BEFORE issuing the write, not after. Every concurrent write to a
+        // newly-seen tag reaches this point, and marking it seen only on success meant all of them
+        // issued their own INSERT -- a burst of identical registrations proportional to the write
+        // concurrency, on the client's own write path, exactly when a table is warming up (a restart
+        // empties this cache, so it is every tag's first write again). Claiming first bounds it to
+        // one write per tag per node; the claim is released again below if the write fails, so a
+        // failed registration is still retried by a later write rather than being cached as done.
+        boolean claimed = seen.size() < MAX_CACHED_TAGS_PER_TABLE && seen.add(tag);
         try
         {
             QueryProcessor.process(query, cl, values);
-            if (seen.size() < MAX_CACHED_TAGS_PER_TABLE)
-                seen.add(tag);
         }
         catch (RuntimeException e)
         {
+            if (claimed)
+                seen.remove(tag);
             NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, base.keyspace + '.' + base.name + ":tag-registry-write",
                              5, TimeUnit.MINUTES,
                              "Tiered storage: could not register a tag of {}.{}; it will be picked up by the next " +
@@ -239,11 +247,20 @@ public final class TagRegistry
      */
     static void noteTagIfTiered(TableMetadata base, org.apache.cassandra.db.DecoratedKey key)
     {
-        List<ByteBuffer> tag = tagOf(base, key);
         Set<List<ByteBuffer>> seen = seenTags.get(base.id);
-        if (seen != null && seen.contains(tag))
-            return;
+        List<ByteBuffer> tag = null;
+        if (seen != null)
+        {
+            tag = tagOf(base, key);
+            if (seen.contains(tag))
+                return; // the overwhelmingly common case: known table, known tag
+        }
 
+        // Deliberately after the cache probe and before {@link #tagOf}: this is the path taken by
+        // every write to every NON-tiered table that happens to be clustered by a timestamp, on every
+        // write forever, and fromTable resolves that to a single extensions-map lookup returning null.
+        // Building the tag first (as this once did) put a List allocation -- and, on a composite
+        // partition key, a CompositeType.split and array copy -- on that path for no reason at all.
         TieringPolicy policy;
         try
         {
@@ -256,7 +273,7 @@ public final class TagRegistry
         if (policy == null)
             return;
 
-        noteTag(base, policy.consistency, tag);
+        noteTag(base, policy.consistency, tag == null ? tagOf(base, key) : tag);
     }
 
     /** @return {@code key}'s partition-key column values, in the base table's key order. */
