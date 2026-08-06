@@ -159,7 +159,17 @@ public class TieredStorageService implements TieredStorageServiceMBean
      * against a 12s deadline and could never complete, at any table size that matters. 256 keeps a
      * page to a few seconds there, with the deadline an order of magnitude away.
      */
-    static final int TAG_PAGE_SIZE = 256;
+    @VisibleForTesting
+    static volatile int TAG_PAGE_SIZE = 256;
+
+    /** Test-only: shrink the page so a handful of tags exercises multi-page behaviour. */
+    @VisibleForTesting
+    static int setTagPageSizeForTesting(int pageSize)
+    {
+        int previous = TAG_PAGE_SIZE;
+        TAG_PAGE_SIZE = pageSize;
+        return previous;
+    }
 
     public static final String MBEAN_NAME = "org.apache.cassandra.db:type=TieredStorage";
 
@@ -168,6 +178,24 @@ public class TieredStorageService implements TieredStorageServiceMBean
 
     /** How long {@link #stopSweeping} lets an in-flight cycle finish before abandoning it. */
     private static final long SHUTDOWN_GRACE_SECONDS = 10;
+
+    /**
+     * How many pages of the incremental base-table walk one cycle may run (see
+     * {@link #advanceIncrementalScan}). The per-cycle discovery budget: small enough that a cycle
+     * always finishes promptly whatever the table looks like, large enough that a ring of realistic
+     * size is covered in hours rather than days.
+     */
+    @VisibleForTesting
+    volatile int scanPagesPerCycle = 8;
+
+    /** Test-only: {@return the previous budget}. */
+    @VisibleForTesting
+    int setScanPagesPerCycleForTesting(int pages)
+    {
+        int previous = scanPagesPerCycle;
+        scanPagesPerCycle = pages;
+        return previous;
+    }
 
     /** Process-wide singleton wired up by {@link org.apache.cassandra.service.CassandraDaemon#setup()} via {@link #setup}. */
     public static final TieredStorageService instance = new TieredStorageService();
@@ -1203,10 +1231,115 @@ public class TieredStorageService implements TieredStorageServiceMBean
      * happen once a node has joined the ring, but is treated defensively rather than silently scanning
      * nothing -- this falls back to an unrestricted scan of every tag.
      */
-    private static List<List<ByteBuffer>> enumerateTags(TableMetadata base, String tagCqlList, List<String> tagRawNames,
-                                                        String baseRef, ConsistencyLevel cl, TierRunStats stats,
-                                                        boolean registryBacked)
+    /**
+     * Advances this table's incremental base-table walk by at most {@link #scanPagesPerCycle} pages,
+     * registering every tag it finds, and returns having done a <b>bounded</b> amount of work.
+     *
+     * <p>This replaces trying to enumerate the whole ring inside one cycle, which on a large table
+     * simply cannot be done: paging does not bound a {@code SELECT DISTINCT}, because its {@code LIMIT}
+     * counts only partitions that still have a live row, so a page asked for {@value #TAG_PAGE_SIZE}
+     * tags walks past however many already-tiered or static-only partitions lie between them. Measured
+     * in production, every token range failed on every cycle, permanently.
+     *
+     * <p>So the walk stops trying to finish. Each page resumes from {@code token(pk) > cursor} -- rows
+     * come back in token order, so the last row's token is where to continue -- and the cursor is
+     * advanced only for pages that actually returned. A page that fails leaves the cursor where it
+     * was, so the next cycle retries the same ground rather than skipping it; a short page means the
+     * ring is exhausted, and the cursor rewinds for the next pass. Full coverage arrives over many
+     * cycles instead of never.
+     *
+     * <p><b>Not restricted to this node's primary ranges.</b> The walk covers the whole ring and
+     * {@link #restrictToPrimaryRanges} filters at read time, which is exact but has every node
+     * scanning every range. That is free on a single-node cluster and N-times redundant on a cluster
+     * of N; narrowing the walk to owned ranges is a worthwhile refinement, not a correctness fix.
+     */
+    private void advanceIncrementalScan(TableMetadata base, String tagCqlList, List<String> tagRawNames,
+                                        String baseRef, ConsistencyLevel cl, TierRunStats stats)
     {
+        AbstractType<?> tokenType = base.partitioner.getTokenValidator();
+        String tokenAlias = tokenAlias(base);
+        String query = format("SELECT DISTINCT %s, token(%s) AS %s FROM %s WHERE token(%s) > ? LIMIT %d",
+                              tagCqlList, tagCqlList, tokenAlias, baseRef, tagCqlList, TAG_PAGE_SIZE);
+        String firstPage = format("SELECT DISTINCT %s, token(%s) AS %s FROM %s LIMIT %d",
+                                  tagCqlList, tagCqlList, tokenAlias, baseRef, TAG_PAGE_SIZE);
+
+        for (int page = 0; page < scanPagesPerCycle; page++)
+        {
+            Token cursor = TagRegistry.scanCursor(base);
+            List<UntypedResultSet.Row> rows;
+            try
+            {
+                rows = cursor == null
+                       ? pagedSelect(firstPage, cl, Collections.emptyList(), Integer.MAX_VALUE, TAG_PAGE_SIZE)
+                       : pagedSelect(query, cl,
+                                     Collections.singletonList(tokenType.decomposeUntyped(cursor.getTokenValue())),
+                                     Integer.MAX_VALUE, TAG_PAGE_SIZE);
+            }
+            catch (RuntimeException e)
+            {
+                // The cursor is untouched, so the next cycle retries exactly here. Counted, because a
+                // cycle whose discovery made no progress has not done everything it was asked to.
+                stats.tagsSkipped++;
+                logger.warn("Tiered storage: {}.{}'s incremental tag scan failed at cursor {}; retrying from the " +
+                            "same position next cycle", base.keyspace, base.name, cursor, e);
+                return;
+            }
+
+            for (UntypedResultSet.Row row : rows)
+            {
+                List<ByteBuffer> tag = new ArrayList<>(tagRawNames.size());
+                for (String name : tagRawNames)
+                    tag.add(row.getBytes(name));
+                TagRegistry.noteTag(base, cl, tag);
+            }
+
+            if (rows.isEmpty() || rows.size() < TAG_PAGE_SIZE)
+            {
+                // The ring is exhausted: a full pass is done. Rewind so the next pass picks up tags
+                // created since, and record the pass so the reconcile interval is honoured.
+                TagRegistry.rewindScanCursor(base);
+                TagRegistry.reconcileAttempted(base);
+                return;
+            }
+
+            UntypedResultSet.Row last = rows.get(rows.size() - 1);
+            TagRegistry.advanceScanCursor(base, base.partitioner.getTokenFactory()
+                                                                .fromByteArray(last.getBytes(tokenAlias)));
+        }
+    }
+
+    /**
+     * @return a name for the {@code token(...)} result column that cannot collide with a partition key
+     * column of {@code base}, grown by prefix in the same way {@link #writetimeAliasPrefix} does.
+     */
+    private static String tokenAlias(TableMetadata base)
+    {
+        Set<String> taken = new HashSet<>();
+        for (ColumnMetadata column : base.partitionKeyColumns())
+            taken.add(column.name.toString());
+
+        String alias = "tok";
+        while (taken.contains(alias))
+            alias = '_' + alias;
+        return alias;
+    }
+
+    private List<List<ByteBuffer>> enumerateTags(TableMetadata base, String tagCqlList, List<String> tagRawNames,
+                                                 String baseRef, ConsistencyLevel cl, TierRunStats stats,
+                                                 boolean registryBacked)
+    {
+        if (registryBacked)
+        {
+            // Bounded discovery first, so the registry read below sees this cycle's findings.
+            advanceIncrementalScan(base, tagCqlList, tagRawNames, baseRef, cl, stats);
+
+            List<List<ByteBuffer>> registered = TagRegistry.read(base, cl);
+            if (!registered.isEmpty())
+                return restrictToPrimaryRanges(base, registered);
+            // Still empty -- the very first cycle on a table the walk has not reached yet. Fall through
+            // to the legacy scan rather than encoding nothing at all.
+        }
+
         if (registryBacked && !TagRegistry.dueForReconcile(base))
         {
             List<List<ByteBuffer>> registered = TagRegistry.read(base, cl);

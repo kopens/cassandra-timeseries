@@ -37,6 +37,7 @@ import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableId;
@@ -122,8 +123,41 @@ public final class TagRegistry
      */
     private static final ConcurrentHashMap<TableId, Long> lastReconcileAttemptMillis = new ConcurrentHashMap<>();
 
+    /**
+     * {@link TableId} -> the token the incremental base-table scan should resume <em>after</em>;
+     * absent means "start at the beginning of the ring".
+     *
+     * <p>Deliberately in memory only, unlike the registry itself. What must survive a restart is the
+     * <em>result</em> of scanning -- which tags exist -- and that is in the registry table. Losing the
+     * position only costs re-walking ground already covered, and the tags found there are already
+     * registered and already being encoded, so nothing regresses. Persisting it would mean either a
+     * fourth shadow table per base table or a column added to an existing one, and neither is worth
+     * paying for a value whose loss is this cheap. If frequent restarts are ever shown to stop the
+     * walk reaching the far end of the ring, persisting it is the fix -- but that should be measured
+     * first, not assumed.
+     */
+    private static final ConcurrentHashMap<TableId, Token> scanCursor = new ConcurrentHashMap<>();
+
     private TagRegistry()
     {
+    }
+
+    /** @return the token to resume the incremental scan after, or {@code null} to start from the beginning. */
+    static Token scanCursor(TableMetadata base)
+    {
+        return scanCursor.get(base.id);
+    }
+
+    /** Records how far the incremental scan got. */
+    static void advanceScanCursor(TableMetadata base, Token token)
+    {
+        scanCursor.put(base.id, token);
+    }
+
+    /** Sends the incremental scan back to the start of the ring, a full pass having completed. */
+    static void rewindScanCursor(TableMetadata base)
+    {
+        scanCursor.remove(base.id);
     }
 
     /**
@@ -152,6 +186,7 @@ public final class TagRegistry
     {
         seenTags.clear();
         lastReconcileAttemptMillis.clear();
+        scanCursor.clear();
     }
 
     /**

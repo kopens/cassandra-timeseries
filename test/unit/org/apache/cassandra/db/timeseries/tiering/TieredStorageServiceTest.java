@@ -803,6 +803,62 @@ public class TieredStorageServiceTest extends CQLTester
     }
 
     @Test
+    public void incrementalScanCoversTheRingAcrossCyclesInsteadOfTimingOut() throws Throwable
+    {
+        // The registry made enumeration cheap for tags the write path has seen, but the backlog -- tags
+        // whose rows predate tiering and that nothing writes to any more -- is only discoverable by
+        // scanning the base table, and on the table this exists for that scan cannot finish. Paging
+        // does not bound it: DISTINCT's LIMIT counts only tags that still have a live row, so a page
+        // asked for 256 tags walks past however many already-tiered or static-only partitions lie
+        // between them. Measured in production: every token range failed, every cycle, forever.
+        //
+        // So the scan stops trying to finish. Each cycle advances a cursor by a bounded number of
+        // pages and registers what it found; the ring is covered over many cycles instead of one.
+        TagRegistry.resetForTesting();
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        setPolicy("{\"hot_window\":\"2h\",\"chunk_window\":\"1h\"}");
+
+        long wt = 1;
+        for (int t = 0; t < 6; t++)
+            insertRow("tag" + t, 0L, t, wt++);
+
+        TieredStorageService service = new TieredStorageService();
+        int previousBudget = service.setScanPagesPerCycleForTesting(1);
+        int previousPage = TieredStorageService.setTagPageSizeForTesting(2);
+        try
+        {
+            // One page of two tags per cycle: the ring takes three cycles to cover, and each cycle
+            // registers strictly more than the last without ever running an unbounded scan.
+            service.runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+            assertEquals(2, registeredTagCount());
+            service.runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+            assertEquals(4, registeredTagCount());
+            service.runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+            assertEquals(6, registeredTagCount());
+
+            // A further cycle finds the ring exhausted, wraps, and does not lose what it knows.
+            service.runOnce(KEYSPACE, currentTable(), 5 * HOUR);
+            assertEquals(6, registeredTagCount());
+        }
+        finally
+        {
+            service.setScanPagesPerCycleForTesting(previousBudget);
+            TieredStorageService.setTagPageSizeForTesting(previousPage);
+        }
+
+        // And every tag the walk discovered was encoded -- the point of discovering them.
+        for (int t = 0; t < 6; t++)
+            assertEquals("tag" + t + " should have been chunked", 1, execute(chunkSelectQuery(), "tag" + t, new Date(0L)).size());
+    }
+
+    /** @return how many tags are in the current table's registry. */
+    private int registeredTagCount() throws Throwable
+    {
+        return execute(String.format("SELECT tag FROM %s.%s WHERE scope = 'tags'",
+                                     KEYSPACE, ChunkTables.tagsTableName(currentTable()))).size();
+    }
+
+    @Test
     public void tagRegistryIsPopulatedAndThenDrivesEnumeration() throws Throwable
     {
         // The registry exists so the steady-state cycle stops paying for SELECT DISTINCT over the
