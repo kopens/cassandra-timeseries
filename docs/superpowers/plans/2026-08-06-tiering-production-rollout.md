@@ -146,6 +146,52 @@ walked the whole 11k-tag backlog logging one ERROR each: thousands of lines in t
 `sweepStopping` latch is checked by the encode loop, the cold-expiry loop and the per-tag handler
 so the cycle leaves quietly.
 
+## A TTL'd table on UnifiedCompactionStrategy is a standing leak
+
+Not a tiering bug, but found while chasing tiering's compaction load, and the single largest win of
+the day — so it belongs next to the rest.
+
+`pp.tm_flow_log`: `PRIMARY KEY (bucket, ts, log_id)`, clustered by time, `default_time_to_live` of 7
+days, never read, on `UnifiedCompactionStrategy`. It held **1,088 SSTables and 50 GB** and was the
+largest single contributor to a compaction backlog that would not clear.
+
+UCS compacts by size and level, with no notion of age. So it rewrote data that was days from
+expiring, over and over, while never reclaiming what had already expired — the worst of both. The
+fix was one `ALTER`:
+
+```sql
+ALTER TABLE pp.tm_flow_log WITH compaction = {
+  'class': 'TimeSeriesCompactionStrategy',
+  'window_size': '1d', 'freeze_after': '1d', 'retention': '8d'
+};
+```
+
+Measured, over five minutes and with no operator action beyond the ALTER:
+
+| | before | after |
+|---|---|---|
+| SSTables | 1,088 | 11 |
+| size | 50 GB | 848 MB |
+| its share of the compaction backlog | 36 pending | gone from the list |
+
+The same change on `pp.tm_option_listener_push_cache` (TTL 1 day, 136 SSTables) took it to 7. Total
+compaction backlog went 128 → 53 and the `pp` keyspace went 487 GB → 405 GB.
+
+**`retention` is not optional, and it is the part that is easy to get wrong.** TSCS freezes a closed
+window to a single SSTable and then never compacts it again — so, as its own javadoc says, *data that
+expires after the freeze is not reclaimed by this strategy*. Without `retention` nothing ever drops
+the window. `tstest.tier_probe` shows the failure mode in the same cluster: 5-minute windows, no
+retention, **988 SSTables for 29 MB**. Set `retention` at or just above the table's TTL — below it and
+you delete data before its TTL, which is data loss.
+
+**Two predictions of mine were wrong here, both in the safe direction.** I expected a large one-time
+compaction burst on switching strategy; there was none, because the conversion classifies existing
+SSTables into windows rather than rewriting them (`active=0` throughout). And I expected the win to
+be compaction I/O; the bigger win was 49 GB of expired data that UCS had simply never dropped.
+
+Rule of thumb: **a table with a uniform TTL and time-ordered clustering should not be on UCS.** Check
+`default_time_to_live` against `compaction` when a table's SSTable count runs into the hundreds.
+
 ## Reading the numbers
 
 - **`system_views.timeseries_tiering` counters are per-process** and reset on restart.
