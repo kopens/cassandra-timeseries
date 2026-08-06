@@ -7,6 +7,39 @@ This is the operational counterpart to
 [2026-07-31-chunk-store-sp2.md](2026-07-31-chunk-store-sp2.md), which specifies the re-encode
 cycle. Read that for what tiering *does*; read this before enabling it on a new table.
 
+## Where things stand (end of 2026-08-06)
+
+Deployed and running:
+
+| table | hot_window | chunk_window | interval | cold_window | notes |
+|---|---|---|---|---|---|
+| `pp.tm_tag_point` | 12h | 1h | 5m | *unset* | 44.2M rows encoded; hot_window raised from 3h during an incident, see below |
+| `pp.tm_asset_data_based_second` | 12h | 15m | 5m | *unset* | 176 GB table; active partitions encoding, backlog being discovered by the cursor walk |
+| `tstest.tier_probe` | 10m | 5m | 1m | *unset* | test keyspace |
+
+`timeseries_tiering` accepts exactly five keys and **rejects any it does not know** — `hot_window`
+(required), `chunk_window` (default `1h`, max `31d`), `cold_window`, `consistency` (default
+`LOCAL_QUORUM`), `interval` (default `5m`). Durations are `<positive int><m|h|d>`. There is **no
+`chunk_size`**: a chunk's size is `chunk_window` times the row density of that window, which is why
+sizing it means measuring density first (see the worked example below).
+
+Compaction changes made the same day, on tables with a uniform TTL that were on
+`UnifiedCompactionStrategy` — see the section on that below for the numbers:
+
+| table | compaction | window_size | freeze_after | retention |
+|---|---|---|---|---|
+| `pp.tm_flow_log` | TSCS | 1d | 1d | 8d |
+| `pp.tm_option_listener_push_cache` | TSCS | 6h | 6h | 36h |
+
+Measured across the day: node 450 → 409 GiB, `pp` keyspace 487 → 409 GB, compaction backlog
+168 → ~50, tag enumeration ~220s → under 1s.
+
+**Still open:** the batch writer runs on `-Xmx3g` against an 800k-row queue and saturates whenever
+Cassandra restarts (it recovers on its own once the source stops); `pp.tm_flow_log` has only 74
+buckets for 50 GB, which is a write-side schema question; CI runners for this project are all stale,
+so local builds are the only verification; and Cassandra's logs are recreated on startup, which
+erased the pre-restart evidence twice while diagnosing incidents here.
+
 ## The failure that started it
 
 `pp.tm_tag_point` had a tiering policy for days and its `__chunks` table was **empty**: zero
@@ -44,6 +77,12 @@ query shape*, not by a shared constant.
 
 Once fixed, the first cycle encoded **44,222,757 rows into 24,206 windows with 0 tags skipped**.
 
+**And shrinking the page was not the end of it.** A smaller page bought headroom, not a bound:
+`SELECT DISTINCT`'s `LIMIT` counts only partitions that still have a *live* row, so a page asked for
+256 tags walks past however many already-tiered or static-only partitions lie between them. On the
+176 GB table every token range still failed, on every cycle. The scan now stops trying to finish at
+all — see "Discovery is a bounded walk, not a scan" below.
+
 ## Enumerating tags: why the registry exists
 
 Even with correct paging, walking the ring cost ~220 s per cycle (11,623 tags × 19 ms) against a
@@ -75,6 +114,32 @@ and both were bugs first:
   every non-tiered timestamp-clustered table pays an allocation forever;
 - claim the tag in the seen-set *before* the INSERT and return if the claim is lost, or every
   concurrent writer of a newly-seen tag issues its own registration.
+
+## Discovery is a bounded walk, not a scan
+
+The registry answers "which tags are being written to". It cannot answer "which tags exist" — a tag
+whose rows predate tiering and that nothing writes to any more has no registry entry, and that is
+exactly the backlog most worth compressing. Only the base table knows, and on a large table the
+`SELECT DISTINCT` that asks it does not finish.
+
+So the reconcile stopped trying to finish. Each cycle advances a cursor by at most
+`scanPagesPerCycle` (8) pages of `token(pk) > cursor` — rows come back in token order, so the last
+row's token is where to continue — and registers what it finds. A page that fails leaves the cursor
+untouched, so the next cycle retries that ground rather than skipping it. A short page means the
+ring is exhausted; the cursor rewinds and the next pass begins. Coverage arrives over hours instead
+of never, and no cycle can hang.
+
+Measured on `pp.tm_asset_data_based_second` immediately after deploying it: `tags_skipped` went
+**17 → 1** (17 being every token range, every cycle) and enumeration errors in the log went to
+**zero**.
+
+The cursor lives in memory only. What must survive a restart is *which tags exist*, and that is in
+the registry table; losing the position costs re-walking ground whose tags are already registered
+and already being encoded. Two known limitations, both deliberate: the walk covers the whole ring
+and `restrictToPrimaryRanges` filters at read time, so on an N-node cluster each node scans every
+range — exact, but N-times redundant; and frequent restarts could in principle keep the walk from
+reaching the far end of the ring, which is the point at which persisting the cursor becomes worth
+its cost. Measure before assuming either.
 
 **Known limitation:** the registry has no eviction. A tag that stops existing keeps its row and
 costs one `firstClosedWindowStart` probe per cycle forever. Harmless for a stable tag set; on a
@@ -116,6 +181,13 @@ Worked example, `pp.tm_asset_data_based_second` (176 GB):
 
 Note `max_mutation_size` (half of `commitlog_segment_size`; 160 MiB here) is *not* the binding
 constraint — read amplification is.
+
+**What the histogram actually told us, once chunks existed:** the real density is one sample per
+~10 seconds, so a 15-minute window holds **90 rows**, not 906. The histogram's maximum cell count is
+a worst case across the whole table and it over-estimated the typical partition by an order of
+magnitude. 15m is therefore comfortable but conservative — 1h would still be safe here and would cut
+the chunk-row count by four. Size from the histogram to pick a *safe* starting value, then re-measure
+from the chunk table's own `samples` column and tune.
 
 ### 3. Expect the first cycle to process the whole backlog
 
