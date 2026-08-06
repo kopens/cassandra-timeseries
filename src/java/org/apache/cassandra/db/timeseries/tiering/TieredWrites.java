@@ -257,11 +257,43 @@ public final class TieredWrites
             if (!row.deletion().isLive())
                 found.lowestRowDeleteMs = Math.min(found.lowestRowDeleteMs,
                                                    ColdBoundary.clusteringMs(row.clustering()));
-            else if (hasCellTombstone(row))
+            else if (hasCellTombstone(row) && !isInsert(row))
                 found.lowestCellMs = Math.min(found.lowestCellMs, ColdBoundary.clusteringMs(row.clustering()));
         }
 
         return found.any() ? found : null;
+    }
+
+    /**
+     * @return {@code true} if {@code row} carries a primary-key liveness marker, i.e. it came from an
+     * {@code INSERT} rather than an {@code UPDATE}.
+     *
+     * <p>This is what separates "a write that happens to contain nulls" from "a write whose purpose is
+     * to remove". Both emit cell tombstones and are otherwise identical in the mutation, which is why
+     * the guard used to refuse them together -- and refusing them together took down ingestion in
+     * production. A batch writer replaying its backlog issues {@code INSERT}s that bind null for every
+     * column a given point does not carry (a numeric point leaves {@code value_boolean} null). Once its
+     * backlog aged past {@code hot_window}, every one of those inserts was rejected as if it were a
+     * {@code DELETE}; the writer retried, stayed behind, and was rejected again -- ~2M rows failed and
+     * its queue reached 99.3% of capacity before the boundary was moved by hand. A writer that falls
+     * behind the hot window could never catch up.
+     *
+     * <p>Only {@code INSERT} writes a row marker; {@code UPDATE} never does. So an update whose cells
+     * are all tombstones -- {@code UPDATE t SET col = null WHERE ...}, the shape that is unambiguously
+     * an attempt to un-write -- still has no marker and is still refused. What is now allowed through
+     * is the insert of a row that asserts its own content, nulls included.
+     *
+     * <p><b>The residual risk, stated plainly:</b> an {@code INSERT} against a cold clustering that
+     * binds null for a column the chunk holds a value for will mask that value until
+     * {@code gc_grace_seconds} purges the tombstone, after which the chunk's value reappears -- the
+     * re-encoder merges per column and leaves a column the row does not carry alone. That is the same
+     * resurrection this guard exists to prevent, narrowed to one shape. It is accepted because the
+     * alternative is demonstrably worse: the rule it replaces does not prevent data loss, it causes
+     * it, by making every late write fail.
+     */
+    private static boolean isInsert(Row row)
+    {
+        return !row.primaryKeyLivenessInfo().isEmpty();
     }
 
     private static boolean hasCellTombstone(Row row)

@@ -434,12 +434,33 @@ public class TieredStorageColumnsTest extends CQLTester
     }
 
     @Test
-    public void insertingANullValueIntoAChunkedClusteringIsRejected() throws Throwable
+    public void insertingANullValueIntoAChunkedClusteringIsAllowed() throws Throwable
     {
-        // Same tombstone by another route: an INSERT that binds null for a column deletes that cell.
+        // This test used to assert the opposite, and asserting the opposite took ingestion down.
+        //
+        // An INSERT that binds null for a column does emit a cell tombstone -- the same shape as
+        // `SET col = null` -- so the guard refused both. But binding null for the columns a given
+        // point does not carry is what every batch writer does on every insert, so once such a
+        // writer's backlog aged past hot_window, every write it attempted was refused as if it were a
+        // DELETE. It retried, stayed behind, and was refused again: ~2M rows failed and its queue hit
+        // 99.3% of capacity. A writer that fell behind the hot window could never catch up, and the
+        // rule meant to prevent data loss was causing it.
+        //
+        // The row marker separates the two: only INSERT writes one. `updatingAChunkedColumnToNull
+        // IsRejected` (above) still holds -- that is the shape whose purpose is to un-write.
         chunkOneRow();
-        assertRejectedAsColdWrite("INSERT INTO %s (tag, ts, value) VALUES ('t', ?, ?) USING TIMESTAMP 300",
-                                  new Date(0L), null);
+        execute("INSERT INTO %s (tag, ts, value) VALUES ('t', ?, ?) USING TIMESTAMP 300", new Date(0L), null);
+    }
+
+    @Test
+    public void insertingALateRowIntoAChunkedClusteringIsAllowed() throws Throwable
+    {
+        // The case the incident was actually made of: a backlogged writer replaying a point whose
+        // timestamp has aged into the cold region, carrying a real value for one column and null for
+        // another. The re-encoder merges such a late row into the chunk per column on its next cycle.
+        chunkOneRow();
+        execute("INSERT INTO %s (tag, ts, value, quality) VALUES ('t', ?, ?, ?) USING TIMESTAMP 300",
+                new Date(0L), 42.0, null);
     }
 
     @Test
