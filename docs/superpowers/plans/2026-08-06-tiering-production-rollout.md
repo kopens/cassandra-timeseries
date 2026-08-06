@@ -14,7 +14,7 @@ Deployed and running:
 | table | hot_window | chunk_window | interval | cold_window | notes |
 |---|---|---|---|---|---|
 | `pp.tm_tag_point` | 12h | 1h | 5m | *unset* | 44.2M rows encoded; hot_window raised from 3h during an incident, see below |
-| `pp.tm_asset_data_based_second` | 12h | 15m | 5m | *unset* | 176 GB table; active partitions encoding, backlog being discovered by the cursor walk |
+| `pp.tm_asset_data_based_second` | 12h | 15m | 5m | *unset* | active partitions encoding, backlog being discovered by the cursor walk; on TSCS, see below |
 | `tstest.tier_probe` | 10m | 5m | 1m | *unset* | test keyspace |
 
 `timeseries_tiering` accepts exactly five keys and **rejects any it does not know** — `hot_window`
@@ -30,9 +30,10 @@ Compaction changes made the same day, on tables with a uniform TTL that were on
 |---|---|---|---|---|
 | `pp.tm_flow_log` | TSCS | 1d | 1d | 8d |
 | `pp.tm_option_listener_push_cache` | TSCS | 6h | 6h | 36h |
+| `pp.tm_asset_data_based_second` | TSCS | 1d | 2d | 3651d |
 
-Measured across the day: node 450 → 409 GiB, `pp` keyspace 487 → 409 GB, compaction backlog
-168 → ~50, tag enumeration ~220s → under 1s.
+Measured across the day: node 450 → 250 GiB, `pp` keyspace 487 → 250 GB, compaction backlog
+168 → ~45, tag enumeration ~220s → under 1s.
 
 **Still open:** the batch writer runs on `-Xmx3g` against an 800k-row queue and saturates whenever
 Cassandra restarts (it recovers on its own once the source stops); `pp.tm_flow_log` has only 74
@@ -263,6 +264,37 @@ be compaction I/O; the bigger win was 49 GB of expired data that UCS had simply 
 
 Rule of thumb: **a table with a uniform TTL and time-ordered clustering should not be on UCS.** Check
 `default_time_to_live` against `compaction` when a table's SSTable count runs into the hundreds.
+
+### And a tiered table on UCS is the same leak, for a different reason
+
+`pp.tm_asset_data_based_second` was left on UCS on the reasoning that tiering would shrink it on its
+own — moving cold windows into chunks and range-deleting the source rows. That reasoning was wrong,
+and the numbers said so: **190 SSTables and 271 ms local read latency** while the two tables on TSCS
+sat at 13 and 22.
+
+Tiering *deletes* the source rows, but a delete is a tombstone, and UCS has no reason to go back and
+purge one. So the table kept occupying **165 GB of space for data it no longer served**. The re-encoder
+was doing its job and nothing was reclaiming the result. Switching it to the same settings
+`pp.tm_tag_point` already used:
+
+```sql
+ALTER TABLE pp.tm_asset_data_based_second WITH compaction = {
+  'class': 'TimeSeriesCompactionStrategy',
+  'window_size': '1d', 'freeze_after': '2d', 'retention': '3651d'
+};
+```
+
+| | before | 4 minutes later |
+|---|---|---|
+| SSTables | 190 | 12 |
+| table size | 165 GB | 3.7 GB |
+| node load | 409 GiB | 250 GiB |
+
+`retention` matches the table's 10-year TTL, as it must — shorter would delete data before it expires.
+
+**Tiering and TSCS are one setting, not two.** Tiering moves the data; TSCS is what reclaims the space
+the move frees. Either alone under-delivers, and the failure is silent: the chunk table fills, the
+counters look healthy, and the base table never shrinks.
 
 ## Reading the numbers
 
