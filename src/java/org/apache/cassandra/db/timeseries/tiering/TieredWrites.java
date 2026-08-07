@@ -83,6 +83,21 @@ public final class TieredWrites
      */
     public static void guardColdMutations(List<? extends IMutation> mutations)
     {
+        guardColdMutations(mutations, false);
+    }
+
+    /**
+     * @param fromInsertOnly whether every statement that produced {@code mutations} was an
+     * {@code INSERT}. Only the caller knows this, and only before the mutations are built: statements
+     * in one batch that target the same partition <em>and the same clustering</em> are merged into a
+     * single {@link Row} before this method ever runs, and that merge destroys the distinction. A row
+     * carrying an INSERT's primary-key liveness marker beside a DELETE's cell tombstone is
+     * indistinguishable, by inspection, from an INSERT that bound null -- including by timestamp,
+     * since a batch stamps every statement alike. Deciding here from the row was therefore wrong:
+     * `BEGIN BATCH INSERT ...; DELETE col ... APPLY BATCH` against one cold clustering was accepted.
+     */
+    public static void guardColdMutations(List<? extends IMutation> mutations, boolean fromInsertOnly)
+    {
         // The re-encoder's own range delete is exactly the write this guard exists to reject -- it is
         // also the one write that is allowed to do it, because it deletes rows it has just copied
         // into a chunk. It brackets its whole cycle with the same bypass the read path uses.
@@ -93,7 +108,7 @@ public final class TieredWrites
             for (PartitionUpdate update : mutation.getPartitionUpdates())
             {
                 noteTag(update);
-                guard(update);
+                guard(update, fromInsertOnly);
             }
     }
 
@@ -108,7 +123,9 @@ public final class TieredWrites
         if (TransparentReads.inInternalBypass())
             return;
         noteTag(update);
-        guard(update);
+        // A conditional (LWT) write is never treated as insert-only: CQL3CasRequest merges the
+        // condition's updates the same way a batch does, so the same ambiguity applies.
+        guard(update, false);
     }
 
     /**
@@ -125,7 +142,7 @@ public final class TieredWrites
         TagRegistry.noteTagIfTiered(metadata, update.partitionKey());
     }
 
-    private static void guard(PartitionUpdate update)
+    private static void guard(PartitionUpdate update, boolean fromInsertOnly)
     {
         TableMetadata metadata = update.metadata();
         // Same shape the read path requires: without exactly one timestamp clustering column nothing
@@ -140,7 +157,7 @@ public final class TieredWrites
         // whatever the coverage turns out to be. Asking coverage before looking at the update made
         // every write to the table pay for the ledger, so a ledger that was timing out blocked a
         // request thread per mutation.
-        Tombstones tombstones = tombstonesIn(update, ColdBoundary.isDescending(metadata));
+        Tombstones tombstones = tombstonesIn(update, ColdBoundary.isDescending(metadata), fromInsertOnly);
         if (tombstones == null)
             return;
 
@@ -234,7 +251,7 @@ public final class TieredWrites
     }
 
     /** @return what {@code update} tombstones, or {@code null} if it tombstones nothing at all. */
-    private static Tombstones tombstonesIn(PartitionUpdate update, boolean descending)
+    private static Tombstones tombstonesIn(PartitionUpdate update, boolean descending, boolean fromInsertOnly)
     {
         Tombstones found = new Tombstones();
         found.partitionDelete = !update.partitionLevelDeletion().isLive();
@@ -257,44 +274,13 @@ public final class TieredWrites
             if (!row.deletion().isLive())
                 found.lowestRowDeleteMs = Math.min(found.lowestRowDeleteMs,
                                                    ColdBoundary.clusteringMs(row.clustering()));
-            else if (hasCellTombstone(row) && !isInsert(row))
+            else if (hasCellTombstone(row) && !fromInsertOnly)
                 found.lowestCellMs = Math.min(found.lowestCellMs, ColdBoundary.clusteringMs(row.clustering()));
         }
 
         return found.any() ? found : null;
     }
 
-    /**
-     * @return {@code true} if {@code row} carries a primary-key liveness marker, i.e. it came from an
-     * {@code INSERT} rather than an {@code UPDATE}.
-     *
-     * <p>This is what separates "a write that happens to contain nulls" from "a write whose purpose is
-     * to remove". Both emit cell tombstones and are otherwise identical in the mutation, which is why
-     * the guard used to refuse them together -- and refusing them together took down ingestion in
-     * production. A batch writer replaying its backlog issues {@code INSERT}s that bind null for every
-     * column a given point does not carry (a numeric point leaves {@code value_boolean} null). Once its
-     * backlog aged past {@code hot_window}, every one of those inserts was rejected as if it were a
-     * {@code DELETE}; the writer retried, stayed behind, and was rejected again -- ~2M rows failed and
-     * its queue reached 99.3% of capacity before the boundary was moved by hand. A writer that falls
-     * behind the hot window could never catch up.
-     *
-     * <p>Only {@code INSERT} writes a row marker; {@code UPDATE} never does. So an update whose cells
-     * are all tombstones -- {@code UPDATE t SET col = null WHERE ...}, the shape that is unambiguously
-     * an attempt to un-write -- still has no marker and is still refused. What is now allowed through
-     * is the insert of a row that asserts its own content, nulls included.
-     *
-     * <p><b>The residual risk, stated plainly:</b> an {@code INSERT} against a cold clustering that
-     * binds null for a column the chunk holds a value for will mask that value until
-     * {@code gc_grace_seconds} purges the tombstone, after which the chunk's value reappears -- the
-     * re-encoder merges per column and leaves a column the row does not carry alone. That is the same
-     * resurrection this guard exists to prevent, narrowed to one shape. It is accepted because the
-     * alternative is demonstrably worse: the rule it replaces does not prevent data loss, it causes
-     * it, by making every late write fail.
-     */
-    private static boolean isInsert(Row row)
-    {
-        return !row.primaryKeyLivenessInfo().isEmpty();
-    }
 
     private static boolean hasCellTombstone(Row row)
     {

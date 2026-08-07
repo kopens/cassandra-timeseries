@@ -1047,6 +1047,27 @@ public class TieredStorageColumnsTest extends CQLTester
                                   "APPLY BATCH", new Date(0L));
     }
 
+    @Test
+    public void aBatchCannotSmuggleAColdDeleteThroughByPairingItWithAnInsert() throws Throwable
+    {
+        // The hole the row-marker rule opens if it is applied naively. A BATCH whose statements target
+        // the same partition AND the same clustering is merged into ONE PartitionUpdate row before the
+        // guard ever sees it, so that row carries the INSERT's primary-key liveness marker *and* the
+        // DELETE's cell tombstone. Testing "does this row have a marker" then answers yes, the
+        // tombstone check is skipped, and a genuine delete of chunked data is accepted -- masking the
+        // chunk's value until gc_grace_seconds purges the tombstone, after which it silently returns.
+        //
+        // aBatchCannotSmuggleAColdDeleteThrough (above) does not catch this: a bare DELETE produces no
+        // marker, so it is refused whether or not the rule is right.
+        chunkOneRow();
+        // formatQuery substitutes a single %s, so the second reference is spelled out.
+        String table = KEYSPACE + '.' + currentTable();
+        assertRejectedAsColdWrite("BEGIN BATCH " +
+                                  "INSERT INTO %s (tag, ts) VALUES ('t', ?) USING TIMESTAMP 300 " +
+                                  "DELETE value FROM " + table + " USING TIMESTAMP 300 WHERE tag = 't' AND ts = ? " +
+                                  "APPLY BATCH", new Date(0L), new Date(0L));
+    }
+
     // ---- values Cassandra accepts that a fixed-width column codec cannot represent ----
 
     @Test

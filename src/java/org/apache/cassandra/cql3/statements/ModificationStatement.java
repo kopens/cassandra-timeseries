@@ -953,9 +953,12 @@ public abstract class ModificationStatement implements CQLStatement.SingleKeyspa
      *
      * @return {@code mutations}, for chaining
      */
-    private static <T extends IMutation> List<T> guardTieredColdWrites(List<T> mutations)
+    private <T extends IMutation> List<T> guardTieredColdWrites(List<T> mutations)
     {
-        org.apache.cassandra.db.timeseries.tiering.TieredWrites.guardColdMutations(mutations);
+        // The statement type, not the built mutations: an INSERT that binds null and a DELETE of the
+        // same column produce the identical row, and in a batch they are merged into one before the
+        // guard can look. Only the caller still knows which it was. See TieredWrites.guardColdMutations.
+        org.apache.cassandra.db.timeseries.tiering.TieredWrites.guardColdMutations(mutations, type.isInsert());
         return mutations;
     }
 

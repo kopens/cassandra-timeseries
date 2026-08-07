@@ -1258,10 +1258,23 @@ public class TieredStorageService implements TieredStorageServiceMBean
     {
         AbstractType<?> tokenType = base.partitioner.getTokenValidator();
         String tokenAlias = tokenAlias(base);
+
+        // Halve the page for every consecutive cycle that has failed here, down to a single tag.
+        // Repeating the identical request that just timed out cannot succeed, and the cursor does not
+        // advance past a failure -- so without this a page that is merely too expensive stalls the
+        // walk forever and everything beyond it in the ring is never discovered. Asking for less is
+        // the one thing that might work.
+        int failures = TagRegistry.consecutiveScanFailures(base);
+        int pageSize = Math.max(1, TAG_PAGE_SIZE >> Math.min(failures, 8));
+        if (failures > 0)
+            logger.info("Tiered storage: {}.{}'s tag walk has failed {} cycle(s) at its current position; " +
+                        "retrying with a page of {} instead of {}",
+                        base.keyspace, base.name, failures, pageSize, TAG_PAGE_SIZE);
+
         String query = format("SELECT DISTINCT %s, token(%s) AS %s FROM %s WHERE token(%s) > ? LIMIT %d",
-                              tagCqlList, tagCqlList, tokenAlias, baseRef, tagCqlList, TAG_PAGE_SIZE);
+                              tagCqlList, tagCqlList, tokenAlias, baseRef, tagCqlList, pageSize);
         String firstPage = format("SELECT DISTINCT %s, token(%s) AS %s FROM %s LIMIT %d",
-                                  tagCqlList, tagCqlList, tokenAlias, baseRef, TAG_PAGE_SIZE);
+                                  tagCqlList, tagCqlList, tokenAlias, baseRef, pageSize);
 
         for (int page = 0; page < scanPagesPerCycle; page++)
         {
@@ -1270,18 +1283,20 @@ public class TieredStorageService implements TieredStorageServiceMBean
             try
             {
                 rows = cursor == null
-                       ? pagedSelect(firstPage, cl, Collections.emptyList(), Integer.MAX_VALUE, TAG_PAGE_SIZE)
+                       ? pagedSelect(firstPage, cl, Collections.emptyList(), Integer.MAX_VALUE, pageSize)
                        : pagedSelect(query, cl,
                                      Collections.singletonList(tokenType.decomposeUntyped(cursor.getTokenValue())),
-                                     Integer.MAX_VALUE, TAG_PAGE_SIZE);
+                                     Integer.MAX_VALUE, pageSize);
             }
             catch (RuntimeException e)
             {
                 // The cursor is untouched, so the next cycle retries exactly here. Counted, because a
                 // cycle whose discovery made no progress has not done everything it was asked to.
                 stats.tagsSkipped++;
-                logger.warn("Tiered storage: {}.{}'s incremental tag scan failed at cursor {}; retrying from the " +
-                            "same position next cycle", base.keyspace, base.name, cursor, e);
+                TagRegistry.recordScanFailure(base);
+                logger.warn("Tiered storage: {}.{}'s incremental tag scan failed at cursor {} with a page of {}; " +
+                            "retrying from the same position, with a smaller page, next cycle",
+                            base.keyspace, base.name, cursor, pageSize, e);
                 return;
             }
 
@@ -1293,7 +1308,9 @@ public class TieredStorageService implements TieredStorageServiceMBean
                 TagRegistry.noteTag(base, cl, tag);
             }
 
-            if (rows.isEmpty() || rows.size() < TAG_PAGE_SIZE)
+            TagRegistry.clearScanFailures(base);
+
+            if (rows.isEmpty() || rows.size() < pageSize)
             {
                 // The ring is exhausted: a full pass is done. Rewind so the next pass picks up tags
                 // created since, and record the pass so the reconcile interval is honoured.
@@ -1336,17 +1353,9 @@ public class TieredStorageService implements TieredStorageServiceMBean
             List<List<ByteBuffer>> registered = TagRegistry.read(base, cl);
             if (!registered.isEmpty())
                 return restrictToPrimaryRanges(base, registered);
-            // Still empty -- the very first cycle on a table the walk has not reached yet. Fall through
-            // to the legacy scan rather than encoding nothing at all.
-        }
-
-        if (registryBacked && !TagRegistry.dueForReconcile(base))
-        {
-            List<List<ByteBuffer>> registered = TagRegistry.read(base, cl);
-            // Empty is not "this table has no tags", it is "the registry cannot answer" (missing,
-            // unreadable, or not yet reconciled) -- fall through to the scan, which is always right.
-            if (!registered.isEmpty())
-                return restrictToPrimaryRanges(base, registered);
+            // Still empty -- the very first cycle, before the walk has returned a page. Fall through
+            // to a full scan once rather than encoding nothing at all; from the next cycle on the
+            // walk is the only discovery mechanism and this branch is not taken again.
         }
 
         long skippedBefore = stats.tagsSkipped;

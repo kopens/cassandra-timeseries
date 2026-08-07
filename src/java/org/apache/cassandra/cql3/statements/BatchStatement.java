@@ -415,7 +415,10 @@ public class BatchStatement implements CQLStatement.CompositeCQLStatement
         List<IMutation> mutations = collector.toMutations(state, local ? PotentialTxnConflicts.ALLOW : PotentialTxnConflicts.DISALLOW);
         // Tiered storage: cold data is immutable once chunked (see TieredWrites); a batch must not
         // be a way around the single-statement check.
-        org.apache.cassandra.db.timeseries.tiering.TieredWrites.guardColdMutations(mutations);
+        // Insert-only for the whole batch, or not at all: one DELETE anywhere in it means a merged
+        // row can carry that delete's tombstone under another statement's liveness marker.
+        boolean insertOnly = statements.stream().allMatch(s -> s.type.isInsert());
+        org.apache.cassandra.db.timeseries.tiering.TieredWrites.guardColdMutations(mutations, insertOnly);
         return mutations;
     }
 

@@ -66,21 +66,26 @@ import static java.lang.String.format;
  *     <li>the write path, via {@link #noteTag}: the first write to a tag registers it (subsequent
  *     writes are a hash lookup against {@link #seenTags}), so a tag created after this feature
  *     shipped is in the registry from its first write onward;</li>
- *     <li>a periodic reconcile against the base table, via {@link #dueForReconcile}: the full
- *     DISTINCT scan, run every {@value #RECONCILE_INTERVAL_MINUTES} minutes instead of every cycle,
- *     whose results are written back here.</li>
+ *     <li>the incremental walk, {@code TieredStorageService.advanceIncrementalScan}: a few pages of
+ *     {@code token(pk) > cursor} per cycle, covering the ring over hours.</li>
  * </ul>
- * The reconcile is not redundant with the write path, and dropping it would be a data-tiering bug
- * rather than an optimisation: a tag whose rows predate this feature has no registry entry and may
+ * The walk is not redundant with the write path, and losing it would be a data-tiering bug rather
+ * than a lost optimisation: a tag whose rows predate this feature has no registry entry and may
  * never be written to again (a decommissioned sensor is exactly the case where the backlog most
- * needs tiering), and a tag whose registry write failed would otherwise be missed forever. Missing
- * from the registry means <em>never encoded</em>, silently -- so the base table stays authoritative,
- * and the registry is only ever allowed to make the common case cheap.
+ * needs tiering). Missing from the registry means <em>never encoded</em>, silently.
+ *
+ * <p><b>The walk is the only discovery mechanism, and that is deliberate.</b> An earlier design also
+ * ran a periodic full {@code SELECT DISTINCT} as a backstop. It was removed rather than left in
+ * place, because on the table this registry exists for that scan cannot complete -- so the "backstop"
+ * was a branch that could never run, sitting under a comment claiming it would. Whatever the walk
+ * does not reach is not reached. That puts the weight on the walk never stalling, which is why a
+ * page that fails does not advance the cursor <em>and</em> why the retry shrinks its page
+ * ({@link #consecutiveScanFailures}) instead of repeating a request that just proved too expensive.
  *
  * <p><b>Failure is always toward doing more work, never less.</b> A registry read that fails or
- * comes back empty falls through to the full scan. A registry write that fails is logged and
- * dropped -- the next reconcile picks the tag up. Nothing here can cause a tag to be skipped that
- * the base table would have yielded.
+ * comes back empty falls through to a base-table scan. A registry write that fails is logged and
+ * dropped -- the walk picks the tag up on its next pass. Nothing here can turn "could not find out"
+ * into "there is nothing".
  */
 public final class TagRegistry
 {
@@ -138,6 +143,17 @@ public final class TagRegistry
      */
     private static final ConcurrentHashMap<TableId, Token> scanCursor = new ConcurrentHashMap<>();
 
+    /**
+     * {@link TableId} -> how many cycles in a row the walk has failed at its current cursor.
+     * <p>
+     * A failing page leaves the cursor where it was so the next cycle retries the same ground rather
+     * than skipping it -- which is right, but on its own it means a page that <em>always</em> fails
+     * stalls the walk permanently, and everything beyond that point in the ring is never discovered.
+     * The count lets the retry shrink its page instead of repeating the identical too-expensive
+     * request forever; see {@code TieredStorageService.advanceIncrementalScan}.
+     */
+    private static final ConcurrentHashMap<TableId, Integer> consecutiveScanFailures = new ConcurrentHashMap<>();
+
     private TagRegistry()
     {
     }
@@ -158,6 +174,22 @@ public final class TagRegistry
     static void rewindScanCursor(TableMetadata base)
     {
         scanCursor.remove(base.id);
+    }
+
+    /** @return how many cycles in a row the walk has failed at its current position. */
+    static int consecutiveScanFailures(TableMetadata base)
+    {
+        return consecutiveScanFailures.getOrDefault(base.id, 0);
+    }
+
+    static void recordScanFailure(TableMetadata base)
+    {
+        consecutiveScanFailures.merge(base.id, 1, Integer::sum);
+    }
+
+    static void clearScanFailures(TableMetadata base)
+    {
+        consecutiveScanFailures.remove(base.id);
     }
 
     /**
@@ -187,6 +219,7 @@ public final class TagRegistry
         seenTags.clear();
         lastReconcileAttemptMillis.clear();
         scanCursor.clear();
+        consecutiveScanFailures.clear();
     }
 
     /**
