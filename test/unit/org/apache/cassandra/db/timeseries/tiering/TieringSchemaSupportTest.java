@@ -545,8 +545,14 @@ public class TieringSchemaSupportTest extends CQLTester
             serviceLogger.detachAppender(appender);
         }
 
-        assertTrue("a TTL longer than hot_window must not warn",
-                   appender.list.stream().noneMatch(e -> e.getFormattedMessage().contains("default_time_to_live")));
+        // Narrowly: no ttlShadowsHotWindowWarning. It cannot assert "no message mentions
+        // default_time_to_live", because ttlWithoutColdWindowWarning legitimately fires here -- this
+        // table has a finite TTL and the policy sets no cold_window, so tiering really is about to
+        // convert it from bounded retention to unbounded growth. That warning is the other
+        // direction, and TieringPolicyTest covers it directly.
+        assertTrue("a TTL longer than hot_window must not warn that rows expire before re-encoding",
+                   appender.list.stream().noneMatch(e -> e.getFormattedMessage()
+                                                          .contains("rows expire before the re-encoder")));
     }
 
     private TableMetadata metadata()
