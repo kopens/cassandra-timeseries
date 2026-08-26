@@ -1,0 +1,101 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Runs .gitlab-ci.yml's release gate on this machine, in the same order and with the same
+# commands, so the gate exists whether or not a GitLab runner does.
+#
+#   .build/sh/ci-local              # build-jar -> timeseries-tests -> docker-image -> integration
+#   .build/sh/ci-local --with-cluster   # ...and the 3-node cluster test (slow, needs 3x2G)
+#   .build/sh/ci-local --stage jar      # one stage only: jar | tests | image | integration | cluster
+#
+# Why this exists: the project's GitLab runners have been offline since at least 2026-08-07 and
+# every pipeline since fails with stuck_pending_no_matching_runners -- the jobs never start, so a
+# red pipeline says nothing about the code. Until a runner is back, this is the only thing that
+# actually verifies a change, and it is worth keeping afterwards for pre-push checks.
+#
+# Stages run STRICTLY SERIALLY and stop at the first failure. That is not just fail-fast: ant's
+# `realclean` is the first thing ci-test does, so two of these overlapping would delete each
+# other's resolved dependencies under build/lib/jars and the victim fails with hundreds of
+# "package org.slf4j does not exist" errors that look like a broken change and are not.
+set -o errexit -o nounset -o pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
+cd "$REPO"
+
+# The image the docker stages build and test. Tagged by git describe rather than a fixed 6.0.0 so a
+# run cannot silently test an image somebody else left behind under the release tag.
+IMAGE="${CI_LOCAL_IMAGE:-cassandra-timeseries:local-$(git rev-parse --short HEAD)}"
+STAGE="${CI_LOCAL_STAGE:-}"
+WITH_CLUSTER=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --with-cluster) WITH_CLUSTER=true; shift ;;
+    --stage) STAGE="${2:-}"; shift 2 ;;
+    -h|--help) sed -n '18,32p' "$0"; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+wanted() { [ -z "$STAGE" ] || [ "$STAGE" = "$1" ]; }
+
+started=$(date +%s)
+step() { printf '\n\033[1m== %s\033[0m  (%ss in)\n' "$1" "$(( $(date +%s) - started ))"; }
+
+"$HERE"/ai-build-image
+
+if wanted jar; then
+  step "build-jar"
+  "$HERE"/ai-in-container 'ant -Dant.gen-doc.skip=true -Drat.skip=true clean jar checkstyle checkstyle-test'
+  # The versioning rule in CLAUDE.md: the build must produce this exact path, and the release
+  # pipeline renames from it. Assert the jar was written by THIS run, not left over: ant reports
+  # success without building when it is missing from PATH, and .build/sh/ai-build's log summarizer
+  # prints BUILD SUCCESSFUL on empty input, so "it said it passed" is not evidence on its own.
+  jar=build/apache-cassandra-6.0.0.jar
+  [ -f "$jar" ] || { echo "FATAL: $jar was not produced" >&2; exit 1; }
+  if [ "$(stat -c %Y "$jar")" -lt "$started" ]; then
+    echo "FATAL: $jar predates this run ($(date -d "@$(stat -c %Y "$jar")" -Is)) -- ant did not rebuild" >&2
+    exit 1
+  fi
+  ls -la --time-style=full-iso "$jar"
+fi
+
+if wanted tests; then
+  step "timeseries-tests"
+  "$HERE"/ai-in-container '.build/sh/ci-timeseries-tests.sh'
+fi
+
+if wanted image; then
+  step "docker-image  ($IMAGE)"
+  # --network host: Docker's default bridge has no DNS resolution on the build hosts here, so
+  # apt-get inside the builder stage cannot resolve archive.ubuntu.com.
+  docker build --network host -t "$IMAGE" -f docker/Dockerfile .
+fi
+
+if wanted integration; then
+  step "docker-integration-test"
+  ./docker/integration-test.sh "$IMAGE"
+fi
+
+if [ "$WITH_CLUSTER" = true ] || [ "$STAGE" = cluster ]; then
+  step "docker-cluster-test"
+  ./docker/cluster-test.sh "$IMAGE"
+fi
+
+step "ci-local passed"
+echo "   image: $IMAGE"

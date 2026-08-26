@@ -127,13 +127,20 @@ Never treat `BUILD SUCCESSFUL` from those wrappers as evidence on its own. Build
 instead, using the same image CI uses:
 
 ```bash
-.claude/skills/upstream-merge/scripts/build-image.sh          # bundled with this skill; idempotent, ~1 min the first time
-.claude/skills/upstream-merge/scripts/in-container.sh 'ant -Dant.gen-doc.skip=true -Drat.skip=true clean jar checkstyle checkstyle-test'
+.build/sh/ai-build-image          # idempotent; ~1 min the first time
+.build/sh/ai-in-container 'ant -Dant.gen-doc.skip=true -Drat.skip=true clean jar checkstyle checkstyle-test'
 ```
 
 `--network host` is required for both the image build and the runs — Docker's default bridge has no
 working DNS on this host, so `apt-get` inside a plain `docker build` fails to resolve
-`archive.ubuntu.com`. The bundled scripts already pass it.
+`archive.ubuntu.com`. Both scripts already pass it.
+
+To run the whole release gate rather than just the build, use `.build/sh/ci-local`, which walks
+`.gitlab-ci.yml`'s stages in order (jar → tests → image → integration test) on this machine. That is
+worth doing after an upstream merge, and right now it is the *only* thing that verifies one: the
+project's GitLab runners have been offline since at least 2026-08-07, so every pipeline fails with
+`stuck_pending_no_matching_runners` before a job starts and a red pipeline says nothing about the
+code (`glab ci get -p <id>` shows it).
 
 Confirm the build really happened, by name *and* by timestamp:
 
@@ -147,7 +154,7 @@ Compile failures after an upstream merge are usually upstream tightening a signa
 calls. Read the actual error rather than the summary:
 
 ```bash
-.claude/skills/upstream-merge/scripts/in-container.sh 'ant -Dant.gen-doc.skip=true -Drat.skip=true build-test 2>&1 | grep -E "error:|error\]"'
+.build/sh/ai-in-container 'ant -Dant.gen-doc.skip=true -Drat.skip=true build-test 2>&1 | grep -E "error:|error\]"'
 ```
 
 Fix fork-side callers to match upstream's new contract, and leave a short comment naming the
@@ -158,7 +165,7 @@ upstream ticket so the next reader knows why the shim exists.
 Run the fork's own CI suite — it is the set of classes that actually cover the fork delta:
 
 ```bash
-.claude/skills/upstream-merge/scripts/in-container.sh '.build/sh/ci-timeseries-tests.sh'
+.build/sh/ai-in-container '.build/sh/ci-timeseries-tests.sh'
 ```
 
 It writes one summary line per class and treats "0 tests ran" as a failure, so unlike `ant testsome`
@@ -173,7 +180,7 @@ loop *inside* one container invocation rather than starting a container per clas
 For a single class, bypass the summarizer and read the JUnit line yourself:
 
 ```bash
-.claude/skills/upstream-merge/scripts/in-container.sh '.build/sh/ci-test <FQCN> 2>&1 | grep -E "Tests run:|BUILD "'
+.build/sh/ai-in-container '.build/sh/ci-test <FQCN> 2>&1 | grep -E "Tests run:|BUILD "'
 ```
 
 Report results with the actual `Tests run: N, Failures: 0, Errors: 0` lines. If something fails,

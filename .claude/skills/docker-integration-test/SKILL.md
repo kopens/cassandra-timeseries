@@ -44,6 +44,22 @@ step, they take hours and need a 16G heap and a host bind-mount.
 
 ## Running
 
+For the whole gate — build the jar, run the fork's test classes, build the image, run the
+integration test, in `.gitlab-ci.yml`'s own order — use the one wrapper:
+
+```bash
+.build/sh/ci-local                 # add --with-cluster for the 3-node test
+.build/sh/ci-local --stage image   # or one stage: jar | tests | image | integration | cluster
+```
+
+It tags the image by commit so a run cannot silently test something left behind under
+`cassandra-timeseries:6.0.0`, and it fails if the jar predates the run rather than trusting ant's
+log. Prefer it over driving the scripts by hand — and note that **it is currently the only thing
+that verifies anything**: the project's GitLab runners have been offline since at least 2026-08-07,
+so every pipeline fails with `stuck_pending_no_matching_runners` before a job starts.
+
+To drive one script directly against an image you already have:
+
 ```bash
 ./docker/integration-test.sh cassandra-timeseries:6.0.0
 ./docker/cluster-test.sh     cassandra-timeseries:6.0.0
