@@ -21,6 +21,7 @@
 #   .build/sh/ci-perf                 # measure and compare
 #   .build/sh/ci-perf --record        # measure and OVERWRITE the baseline (see below)
 #   PERF_THRESHOLD=15 .build/sh/ci-perf   # tighten the allowed regression (default 25%)
+#   PERF_PASSES=5 .build/sh/ci-perf       # more sweeps, minimum kept (default 3)
 #
 # This is a gate, not a benchmark. docker/scale-test.sh and docker/tiering-bench.sh answer
 # "how fast on production-shaped data"; they take hours and need a 16G heap. This answers the much
@@ -42,6 +43,9 @@ cd "$REPO"
 
 BASELINE="${PERF_BASELINE:-doc/timeseries/perf-baseline.json}"
 THRESHOLD="${PERF_THRESHOLD:-25}"
+# Full sweeps per invocation; the minimum per benchmark is kept. See the loop below for why one is
+# not enough. Three is the smallest number that survived this machine's noise; raise it, never lower.
+PASSES="${PERF_PASSES:-3}"
 RESULT=build/test/output/jmh-result.json
 RECORD=false
 # One JMH invocation per class: the runner takes a regex, and a single one matching all of them
@@ -60,14 +64,56 @@ merged=build/test/output/jmh-merged.json
 mkdir -p "$(dirname "$merged")"
 : > "$merged.parts"
 
+# ONE container for every class, looping inside it. Two reasons, both learned the hard way:
+#
+#   * `microbench` depends on maybe-build-test, which builds the accord submodule through its own
+#     gradlew and publishes it with publishToMavenLocal -- into $HOME. ai-in-container gives each
+#     run a fresh container with HOME=/tmp, so a second container cannot see the first's artifacts:
+#     accord is rebuilt from scratch every time (slow, and the most failure-prone step in the run),
+#     and skipping it with -Dno-build-accord instead breaks dependency resolution outright.
+#   * ant re-resolves dependencies per invocation, so four invocations are four chances for a
+#     network hiccup to read as "the benchmark did not run".
+#
+# jmh-result.json is overwritten per class, so each is copied aside inside the container before the
+# next class starts.
+# PASSES full sweeps, and the MINIMUM per benchmark is kept. One sweep is not a measurement on a
+# shared machine: recording this baseline from a single run put fullScanBySlot at 545us against 433
+# on the two runs either side of it, toTimestamps at 75 against 42, and unpack[width=8] at 1.94
+# against 1.00 -- a baseline that would have waved through a real 40% regression. Noise only ever
+# ADDS time to a latency benchmark, so the minimum is the honest estimate of how fast the code is;
+# an average drags the number toward whatever else the box was doing.
+#
+# It also cuts the other way: a single noisy COMPARE sweep would report a regression that is not
+# there, and a gate that cries wolf gets switched off. Both sides take the same treatment.
+rm -f build/test/output/jmh-part-*.json
+for pass in $(seq 1 "$PASSES"); do
+  echo "== pass $pass/$PASSES"
+  "$HERE"/ai-in-container "
+set -o errexit -o nounset -o pipefail
+n=0
 for class in $CLASSES; do
-  echo "-- $class"
-  rm -f "$RESULT"
-  "$HERE"/ai-in-container "ant microbench -Dbenchmark.name=$class -Dant.gen-doc.skip=true -Drat.skip=true -Dno-checkstyle=true" \
-    | grep -E '^\s+\[java\] (Benchmark|Chunk)' || true
-  [ -f "$RESULT" ] || { echo "FATAL: $class produced no jmh-result.json -- it did not run" >&2; exit 1; }
-  cat "$RESULT" >> "$merged.parts"
+  echo \"-- \$class\"
+  rm -f $RESULT
+  ant microbench -Dbenchmark.name=\$class -Dant.gen-doc.skip=true -Drat.skip=true -Dno-checkstyle=true \
+    | grep -E '^[[:space:]]+\[java\] (Benchmark|Chunk)|BUILD FAILED' || true
+  if [ ! -f $RESULT ]; then
+    echo \"FATAL: \$class produced no jmh-result.json -- it did not run.\" >&2
+    exit 1
+  fi
+  cp $RESULT build/test/output/jmh-part-$pass-\$n.json
+  n=\$((n + 1))
 done
+"
+  expected=$(printf '%s\n' $CLASSES | wc -l)
+  actual=$(ls build/test/output/jmh-part-"$pass"-*.json 2>/dev/null | wc -l)
+  if [ "$actual" -ne "$expected" ]; then
+    echo "FATAL: pass $pass ran $actual of $expected benchmark classes." >&2
+    echo "       A class that silently does not run is exactly what this check exists to catch;" >&2
+    echo "       re-run that class by hand to see ant's output." >&2
+    exit 1
+  fi
+done
+cat build/test/output/jmh-part-*.json >> "$merged.parts"
 
 python3 - "$merged.parts" "$merged" "$BASELINE" "$THRESHOLD" "$RECORD" <<'PY'
 import json, os, socket, sys
@@ -91,11 +137,27 @@ measured = {}
 for r in runs:
     name = r["benchmark"].rsplit(".", 1)[-1]
     cls = r["benchmark"].rsplit(".", 2)[-2]
-    measured[f"{cls}.{name}"] = {
+    # @Param values belong in the key. Without them every width of ChunkBitUnpackBench.unpack and
+    # every mode of ChunkPresenceBench.decode collapse onto one entry, the last one silently wins,
+    # and the gate compares whichever parameter JMH happened to run last while reporting a count
+    # that looks like full coverage.
+    params = r.get("params") or {}
+    suffix = "".join(f"[{k}={params[k]}]" for k in sorted(params))
+    key = f"{cls}.{name}{suffix}"
+    entry = {
         "score": r["primaryMetric"]["score"],
         "error": r["primaryMetric"]["scoreError"],
         "unit": r["primaryMetric"]["scoreUnit"],
     }
+    prev = measured.get(key)
+    # Repeats across passes are expected; keep the best. Better is lower for a time-per-op metric
+    # and higher for a throughput one, so the unit decides which way "best" runs.
+    if prev is None:
+        measured[key] = entry
+    elif "ops" in entry["unit"]:
+        measured[key] = max(prev, entry, key=lambda e: e["score"])
+    else:
+        measured[key] = min(prev, entry, key=lambda e: e["score"])
 
 host = socket.gethostname()
 json.dump({"host": host, "benchmarks": measured}, open(merged_path, "w"), indent=2, sort_keys=True)
