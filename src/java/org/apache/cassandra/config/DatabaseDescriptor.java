@@ -3056,8 +3056,8 @@ public class DatabaseDescriptor
 
     public static void setCompressedReadAheadBufferSizeInKb(int sizeInKb)
     {
-        if (sizeInKb < 256)
-            throw new IllegalArgumentException("compressed_read_ahead_buffer_size_in_kb must be at least 256KiB");
+        if (sizeInKb < 0 || (sizeInKb > 0 && sizeInKb < 256))
+            throw new IllegalArgumentException("compressed_read_ahead_buffer_size_in_kb must be at least 256KiB (set to 0 to disable)");
 
         conf.compressed_read_ahead_buffer_size = createIntKibibyteBoundAndEnsureItIsValidForByteConversion(sizeInKb, "compressed_read_ahead_buffer_size");
     }
@@ -4480,9 +4480,9 @@ public class DatabaseDescriptor
         return conf.trickle_fsync;
     }
 
-    public static int getTrickleFsyncIntervalInKiB()
+    public static long getTrickleFsyncIntervalInBytes()
     {
-        return conf.trickle_fsync_interval.toKibibytes();
+        return conf.trickle_fsync_interval.toBytesInLong();
     }
 
     public static long getKeyCacheSizeInMiB()
@@ -6337,6 +6337,11 @@ public class DatabaseDescriptor
     public static long getDiscoveryTimeout(TimeUnit unit)
     {
         return conf.discovery_timeout.to(unit);
+    }
+
+    public static int getDiscoveryRounds()
+    {
+        return conf.discovery_rounds;
     }
 
     public static boolean getUnsafeTCMMode()

@@ -44,6 +44,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DataStorageSpec;
 import org.apache.cassandra.io.compress.BufferType;
+import org.apache.cassandra.io.compress.CorruptBlockException;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.utils.Pair;
 
@@ -108,7 +109,17 @@ public class ThreadLocalReadAheadBufferTest implements WithQuickTheories
             // Each pool thread faults in its own read-ahead block; barrier on completion.
             List<Future<?>> allocations = new ArrayList<>();
             for (int i = 0; i < threads; i++)
-                allocations.add(pool.submit(() -> tlrab.fill(0)));
+                allocations.add(pool.submit(() -> {
+                    // fill() declares CorruptBlockException (CASSANDRA-21519); a Runnable cannot.
+                    try
+                    {
+                        tlrab.fill(0);
+                    }
+                    catch (CorruptBlockException e)
+                    {
+                        throw new RuntimeException(e);
+                    }
+                }));
             for (Future<?> allocation : allocations)
                 allocation.get(30, TimeUnit.SECONDS);
 
@@ -199,7 +210,7 @@ public class ThreadLocalReadAheadBufferTest implements WithQuickTheories
                     copied += tlrab.read(buf2, tlrab.remaining());
             }
         }
-        catch (CorruptSSTableException e)
+        catch (CorruptSSTableException | CorruptBlockException e)
         {
             throw new RuntimeException(e);
         }
