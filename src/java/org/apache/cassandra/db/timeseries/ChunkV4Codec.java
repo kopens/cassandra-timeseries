@@ -1187,6 +1187,37 @@ public final class ChunkV4Codec
             return column == null ? null : column.value();
         }
 
+        /**
+         * {@inheritDoc}
+         *
+         * <p>The slot IS the index into {@link #columns}, which {@link #find} binary-searches by name. Resolving
+         * it once per scan is the whole point: {@link #columns} is fixed for the cursor's lifetime, so a name
+         * lookup per cell is repeated work on a per-scan constant.
+         */
+        @Override
+        public int columnSlot(String name)
+        {
+            for (int i = 0; i < columns.length; i++)
+                if (columns[i].name.equals(name))
+                    return i;
+            return ABSENT_COLUMN;
+        }
+
+        @Override
+        public byte[] getByteArray(int slot)
+        {
+            requirePositioned();
+            return slot == ABSENT_COLUMN ? null : columns[slot].value();
+        }
+
+        @Override
+        public ByteBuffer getBytes(int slot)
+        {
+            byte[] value = getByteArray(slot);
+            // wrap(), NEVER asReadOnlyBuffer() -- see getBytes(String).
+            return value == null ? null : ByteBuffer.wrap(value);
+        }
+
         @Override
         public ByteBuffer getBytes(String name)
         {

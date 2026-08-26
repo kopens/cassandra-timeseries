@@ -834,74 +834,108 @@ public final class TimeSeriesFcts
                         if (size == 1)
                             return DoubleType.instance.decompose(average ? vals[0] : 0.0);
 
-                        // Integrate over timestamp order. The common (already-sorted) case needs no allocation.
-                        int[] order = sortedOrder();
-                        long totalMillis = times[order[size - 1]] - times[order[0]];
+                        // Integrate over timestamp order. Both orders a time-series partition actually
+                        // arrives in are read positionally, so neither allocates a permutation.
+                        int direction = arrivalDirection(times, size, sorted);
+                        int[] order = direction == ARRIVED_UNORDERED ? timestampPermutation(times, size) : null;
+
+                        int first = orderedIndex(order, direction, size, 0);
+                        int last = orderedIndex(order, direction, size, size - 1);
+                        long totalMillis = times[last] - times[first];
                         if (totalMillis == 0)
-                            return DoubleType.instance.decompose(average ? vals[order[0]] : 0.0);
+                            return DoubleType.instance.decompose(average ? vals[first] : 0.0);
 
                         // Trapezoidal area in value-milliseconds.
                         double area = 0;
+                        int prev = first;
                         for (int i = 1; i < size; i++)
                         {
-                            int prev = order[i - 1], cur = order[i];
+                            int cur = orderedIndex(order, direction, size, i);
                             double dt = times[cur] - times[prev];
                             double meanValue = (vals[cur] + vals[prev]) / 2.0;
                             area += meanValue * dt;
+                            prev = cur;
                         }
 
                         // time_weighted_average = area / span; integral = area expressed in value-seconds.
                         return DoubleType.instance.decompose(average ? area / totalMillis : area / 1000.0);
                     }
 
-                    /** Identity order when input is already sorted; otherwise a timestamp-sorted index permutation. */
-                    private int[] sortedOrder()
-                    {
-                        return timestampOrder(times, size, sorted);
-                    }
                 };
             }
         };
+    }
+
+    /** {@link #arrivalDirection}: the samples arrived in ascending timestamp order. */
+    private static final int ARRIVED_ASCENDING = 1;
+    /** {@link #arrivalDirection}: the samples arrived in strictly descending timestamp order. */
+    private static final int ARRIVED_DESCENDING = -1;
+    /** {@link #arrivalDirection}: neither; a permutation from {@link #timestampPermutation} is required. */
+    private static final int ARRIVED_UNORDERED = 0;
+
+    /**
+     * Classifies the arrival order of {@code times[0, size)} so a caller that only needs to <em>read</em> the
+     * samples in timestamp order can do it positionally, with no permutation array at all.
+     *
+     * <p>Both orders this recognises are the ones a time-series partition actually arrives in: ascending for
+     * in-order ingest and an ASC clustering, descending for a table declared
+     * {@code CLUSTERING ORDER BY (timestamp DESC)}, which is the ordinary shape. Materialising an index
+     * permutation for either of them costs an {@code int[size]} — 160 kB on a 40,000-row partition — plus a fill
+     * pass, and then makes every read in the aggregation loop a dependent load ({@code times[order[i]]}) where a
+     * flat {@code times[i]} would do. Only the genuinely-unordered case needs the array.
+     *
+     * <p>Descending must be <em>strict</em>: reading a run backwards is only stable when no two timestamps tie,
+     * and with a tie the stable merge in {@link #timestampPermutation} is required to keep arrival order — which
+     * is what lets a re-written sample at the same timestamp win.
+     *
+     * @param sorted the caller's own record of whether every sample arrived at or after its predecessor, kept
+     *               during {@code addInput} so the ascending case costs nothing to detect here
+     * @return {@link #ARRIVED_ASCENDING}, {@link #ARRIVED_DESCENDING} or {@link #ARRIVED_UNORDERED}
+     */
+    private static int arrivalDirection(long[] times, int size, boolean sorted)
+    {
+        if (sorted || size < 2)
+            return ARRIVED_ASCENDING;
+
+        for (int i = 1; i < size; i++)
+            if (times[i - 1] <= times[i])
+                return ARRIVED_UNORDERED;
+        return ARRIVED_DESCENDING;
+    }
+
+    /**
+     * The array index holding the {@code i}-th sample in timestamp order.
+     *
+     * @param permutation {@code null} when {@code direction} already describes the order, else the permutation
+     *                    from {@link #timestampPermutation}
+     * @param direction   {@link #ARRIVED_ASCENDING} or {@link #ARRIVED_DESCENDING}; ignored when
+     *                    {@code permutation} is non-null
+     */
+    private static int orderedIndex(int[] permutation, int direction, int size, int i)
+    {
+        if (permutation != null)
+            return permutation[i];
+        return direction == ARRIVED_ASCENDING ? i : size - 1 - i;
     }
 
     /**
      * Returns an index permutation of {@code [0, size)} ordering {@code times} ascending, stably: indices whose
      * timestamps tie keep their arrival order, which is what lets a re-written sample at the same timestamp win.
      *
-     * <p>Three paths, because the one that used to be missing was the common one. An insertion sort is O(n) on an
-     * already-sorted input and O(n²) on a reversed one — and a table declared
-     * {@code CLUSTERING ORDER BY (timestamp DESC)}, which is the ordinary time-series shape, delivers rows in
+     * <p>Only for input {@link #arrivalDirection} classified as {@link #ARRIVED_UNORDERED}; the two ordered cases
+     * are read positionally and never come here. A bottom-up merge sort of the indices, O(n log n), stable, one
+     * {@code int[]} of scratch and no autoboxing.
+     *
+     * <p>Not an insertion sort, which is what this used to be: insertion sort is O(n) on an already-sorted input
+     * but O(n²) on a reversed one, and a {@code CLUSTERING ORDER BY (timestamp DESC)} table delivers rows in
      * exactly that reversed order. On a 100,000-row partition that was ~5e9 comparisons and measured at 14.4 s,
-     * against ~0.5 s for every other aggregate over the same scan. So:
-     * <ul>
-     *   <li>already ascending ({@code sorted}) — identity, O(n);</li>
-     *   <li>strictly descending — reverse, O(n). Strictly, because a reversal is only stable when no two
-     *       timestamps tie; with a tie the merge below is required to keep arrival order;</li>
-     *   <li>anything else — bottom-up merge sort of the indices, O(n log n), stable, one {@code int[]} of scratch
-     *       and no autoboxing.</li>
-     * </ul>
+     * against ~0.5 s for every other aggregate over the same scan.
      */
-    private static int[] timestampOrder(long[] times, int size, boolean sorted)
+    private static int[] timestampPermutation(long[] times, int size)
     {
         int[] order = new int[size];
         for (int i = 0; i < size; i++)
             order[i] = i;
-        if (sorted || size < 2)
-            return order;
-
-        boolean strictlyDescending = true;
-        for (int i = 1; i < size && strictlyDescending; i++)
-            strictlyDescending = times[i - 1] > times[i];
-        if (strictlyDescending)
-        {
-            for (int lo = 0, hi = size - 1; lo < hi; lo++, hi--)
-            {
-                int swap = order[lo];
-                order[lo] = order[hi];
-                order[hi] = swap;
-            }
-            return order;
-        }
 
         int[] scratch = new int[size];
         for (int width = 1; width < size; width <<= 1)
@@ -992,21 +1026,24 @@ public final class TimeSeriesFcts
                             // A single sample has no increase and no time span.
                             return perSecond ? null : DoubleType.instance.decompose(0.0);
 
-                        int[] order = timestampOrder(times, size, sorted);
+                        int direction = arrivalDirection(times, size, sorted);
+                        int[] order = direction == ARRIVED_UNORDERED ? timestampPermutation(times, size) : null;
 
                         double increase = 0;
+                        double prev = vals[orderedIndex(order, direction, size, 0)];
                         for (int i = 1; i < size; i++)
                         {
-                            double prev = vals[order[i - 1]];
-                            double cur = vals[order[i]];
+                            double cur = vals[orderedIndex(order, direction, size, i)];
                             // On a reset (value dropped) the counter is assumed to have restarted from 0.
                             increase += cur >= prev ? cur - prev : cur;
+                            prev = cur;
                         }
 
                         if (!perSecond)
                             return DoubleType.instance.decompose(increase);
 
-                        long spanMillis = times[order[size - 1]] - times[order[0]];
+                        long spanMillis = times[orderedIndex(order, direction, size, size - 1)]
+                                          - times[orderedIndex(order, direction, size, 0)];
                         if (spanMillis == 0)
                             return null;
                         return DoubleType.instance.decompose(increase / (spanMillis / 1000.0));

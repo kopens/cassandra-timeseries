@@ -118,6 +118,30 @@ public class ChunkReadBench
         return rows;
     }
 
+    /**
+     * The same scan addressed by slot instead of by name -- what the transparent-read path in
+     * {@code ChunkReadSupport} does. {@link #fullScan} is the same work with a name lookup per cell, so the two
+     * together price {@link ChunkV4Codec.Cursor#columnSlot}: the columns a scan reads are fixed for its whole
+     * life, and resolving them once is the difference.
+     */
+    @Benchmark
+    public long fullScanBySlot(Blackhole bh)
+    {
+        ChunkV4Codec.Cursor cursor = ChunkV4Codec.cursor(chunk, null);
+        int[] slots = new int[allColumns.length];
+        for (int i = 0; i < allColumns.length; i++)
+            slots[i] = cursor.columnSlot(allColumns[i]);
+        long rows = 0;
+        while (cursor.advance())
+        {
+            bh.consume(cursor.timestamp());
+            for (int slot : slots)
+                bh.consume(cursor.getByteArray(slot));
+            rows++;
+        }
+        return rows;
+    }
+
     /** value + timestamp only: the dominant aggregate-query projection; other sections never parse. */
     @Benchmark
     public long projectedScan(Blackhole bh)

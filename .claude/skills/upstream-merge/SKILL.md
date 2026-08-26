@@ -165,6 +165,11 @@ It writes one summary line per class and treats "0 tests ran" as a failure, so u
 it cannot pass by silently running nothing. It takes a while; start it in the background and do
 other work while it runs.
 
+Run these **one at a time**. `ci-test` starts with a `realclean`, so a second run started
+concurrently deletes `build/lib/jars` out from under the first, and the victim fails with hundreds
+of "package org.slf4j does not exist" errors that look like a broken change and are not. Put the
+loop *inside* one container invocation rather than starting a container per class.
+
 For a single class, bypass the summarizer and read the JUnit line yourself:
 
 ```bash

@@ -343,8 +343,12 @@ public final class ChunkReadSupport
         private ColumnarChunkCodec.ArrayValueCursor arrays;
         /** Whether values come from {@link #arrays} ({@code byte[]}) or the cursor ({@link ByteBuffer}). */
         private final boolean byteArrayValues;
-        /** Chunk column names, and the table columns they resolve to, in BTree (ColumnData) order. */
-        private final String[] names;
+        /**
+         * Cursor slots for the chunk's columns, and the table columns they resolve to, in BTree (ColumnData)
+         * order. Slots rather than names: the cursor's name-keyed accessors binary-search its column directory
+         * on every call, which for a scan is a per-cell lookup of a per-scan constant.
+         */
+        private final int[] slots;
         private final ColumnMetadata[] columns;
         private final long cellTimestamp;
         /**
@@ -388,7 +392,10 @@ public final class ChunkReadSupport
                     byColumn.put(column, name);
             }
             this.columns = byColumn.keySet().toArray(new ColumnMetadata[0]);
-            this.names = byColumn.values().toArray(new String[0]);
+            this.slots = new int[byColumn.size()];
+            int slot = 0;
+            for (String name : byColumn.values())
+                this.slots[slot++] = cursor.columnSlot(name);
             this.scratch = new Object[this.columns.length];
 
             boolean simple = true;
@@ -550,7 +557,7 @@ public final class ChunkReadSupport
          */
         private Object valueOf(int i)
         {
-            return byteArrayValues ? arrays.getByteArray(names[i]) : cursor.getBytes(names[i]);
+            return byteArrayValues ? arrays.getByteArray(slots[i]) : cursor.getBytes(slots[i]);
         }
 
         /**

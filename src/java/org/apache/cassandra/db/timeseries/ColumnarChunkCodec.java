@@ -220,5 +220,12 @@ public final class ColumnarChunkCodec
          * precondition as {@link ColumnarCursor#getBytes}: {@link ColumnarCursor#advance} first.
          */
         byte[] getByteArray(String name);
+
+        /**
+         * The current row's serialized value for the column {@link ColumnarCursor#columnSlot} resolved to
+         * {@code slot}, or {@code null} if that column is absent or null on this row. Same contract as
+         * {@link #getByteArray(String)}, addressed by slot so a scan pays no per-cell name lookup.
+         */
+        byte[] getByteArray(int slot);
     }
 }
