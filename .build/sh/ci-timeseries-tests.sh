@@ -43,9 +43,6 @@ TESTS=(
   "testsome|org.apache.cassandra.index.sai.cql.AnalyzedLikeQueryTest"
   "testsome|org.apache.cassandra.index.sai.cql.AllowFilteringTest"
   "test-jvm-dtest-some|org.apache.cassandra.distributed.test.sai.AnalyzedLikeDistributedTest"
-  "testsome|org.apache.cassandra.db.timeseries.BitStreamTest"
-  "testsome|org.apache.cassandra.db.timeseries.TimestampCodecTest"
-  "testsome|org.apache.cassandra.db.timeseries.Chimp128CodecTest"
   "testsome|org.apache.cassandra.db.timeseries.ChunkCodecsTest"
   "testsome|org.apache.cassandra.db.timeseries.ColumnarChunkCodecTest"
   "testsome|org.apache.cassandra.db.timeseries.tiering.TieringPolicyTest"
@@ -76,6 +73,24 @@ TESTS=(
   "testsome|org.apache.cassandra.db.memtable.TimeSeriesMemtableStreamingReadTest"
   "testsome|org.apache.cassandra.db.timeseries.tiering.ColdWindowChunkFlushTest"
 )
+
+# Guard: a class deleted from the tree stays in TESTS above and then fails every run as a
+# ClassNotFoundException -- which reads as a product failure, so the real signal ("this list is
+# stale") is buried and the suite silently stays red. That happened: the chunk-format-v3 tests were
+# deleted in 74e542db95 and their entries were not. Fail here instead, in the list's own terms,
+# before spending a build on it. Same guard `.build/sh/ai-ci-test` applies to its argument.
+missing=()
+for entry in "${TESTS[@]}"; do
+    class="${entry#*|}"
+    path="${class//.//}.java"
+    compgen -G "test/*/$path" > /dev/null || missing+=("$class")
+done
+if [ "${#missing[@]}" -gt 0 ]; then
+    echo "ERROR: ${#missing[@]} entry(ies) in TESTS name a class that does not exist under test/*/:" >&2
+    printf '  %s\n' "${missing[@]}" >&2
+    echo "Remove them from this script, or restore the class." >&2
+    exit 2
+fi
 
 # Reads the JUnit XML rather than trusting ant's exit code. Prints "tests failures errors"
 # or "MISSING" when no report was produced at all.

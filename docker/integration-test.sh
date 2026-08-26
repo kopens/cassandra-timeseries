@@ -35,22 +35,26 @@ echo "   runtime: $RUNTIME   image: $IMAGE"
 
 $RUNTIME run -d --name "$CONTAINER" "$IMAGE" > /dev/null || { echo "FATAL: container did not start"; exit 2; }
 
-# The node is ready once it answers CQL on the native protocol.
-printf '   waiting for CQL'
-ready=0
-for _ in $(seq 1 $((READY_TIMEOUT / 5))); do
-    if $RUNTIME exec "$CONTAINER" cqlsh -e "SELECT release_version FROM system.local" > /dev/null 2>&1; then
-        ready=1; break
+# The node is ready once it answers CQL on the native protocol. A function rather than an inline
+# loop because the restart section at the end of this script waits the same way.
+wait_for_cql() {
+    local ready=0
+    printf '   waiting for CQL'
+    for _ in $(seq 1 $((READY_TIMEOUT / 5))); do
+        if $RUNTIME exec "$CONTAINER" cqlsh -e "SELECT release_version FROM system.local" > /dev/null 2>&1; then
+            ready=1; break
+        fi
+        printf '.'
+        sleep 5
+    done
+    echo
+    if [ "$ready" != 1 ]; then
+        echo "FATAL: node did not become ready within ${READY_TIMEOUT}s"
+        $RUNTIME logs "$CONTAINER" 2>&1 | tail -40
+        exit 2
     fi
-    printf '.'
-    sleep 5
-done
-echo
-if [ "$ready" != 1 ]; then
-    echo "FATAL: node did not become ready within ${READY_TIMEOUT}s"
-    $RUNTIME logs "$CONTAINER" 2>&1 | tail -40
-    exit 2
-fi
+}
+wait_for_cql
 
 cql() { $RUNTIME exec "$CONTAINER" cqlsh --no-color -e "$1" 2>&1; }
 
@@ -152,6 +156,32 @@ check_nodetool() {
     return 0
 }
 
+# assert <description> <actual> <expected> -- for values this script computed itself rather than
+# read out of a cqlsh table (sstable counts, and anything else that comes from nodetool parsing).
+# Reports the value either way, so a passing run says what it saw instead of just "ok".
+assert() {
+    local desc="$1" actual="${2:-<none>}" expected="$3" status
+    if [ "$actual" = "$expected" ]; then PASS=$((PASS + 1)); status="ok  "
+    else FAIL=$((FAIL + 1)); status="FAIL"; fi
+    printf '\n   [%s] %-56s\n' "$status" "$desc"
+    printf '        got> %s   (expected: %s)\n' "$actual" "$expected"
+
+    {
+        printf '<tr class="%s"><td class="st">%s</td><td>%s</td><td><pre>%s</pre></td><td><pre>%s</pre></td><td class="ms">%s</td></tr>\n' \
+            "$([ "$status" = FAIL ] && echo fail || echo pass)" \
+            "$([ "$status" = FAIL ] && echo '✗ FAIL' || echo '✓ pass')" \
+            "$(printf '%s' "$desc" | esc)" \
+            "computed by the harness (expected: $(printf '%s' "$expected" | esc))" \
+            "$(printf '%s' "$actual" | esc)" \
+            ""
+    } >> "$ROWS"
+    {
+        printf '\n### %s %s\n\n```\nexpected: %s\ngot:      %s\n```\n' \
+            "$([ "$status" = FAIL ] && echo '❌' || echo '✅')" "$desc" "$expected" "$actual"
+    } >> "$MDROWS"
+    return 0
+}
+
 write_report() {
     mkdir -p "$(dirname "$REPORT")"
     {
@@ -223,6 +253,14 @@ HTML
     echo "   report: $REPORT"
     echo "   report: $REPORT_MD"
 }
+
+# The image under test is built from the repo (docker/Dockerfile compiles it in a builder stage), so
+# the version the node reports is the one thing that distinguishes "I tested this change" from "I
+# tested whatever was tagged cassandra-timeseries:6.0.0 last month". It also pins the fork's
+# versioning rule -- an upstream merge that resets base.version to an alpha would land here.
+section "image identity"
+check "the node reports release_version 6.0.0" \
+    "SELECT release_version FROM system.local;" '^ *6\.0\.0 *$'
 
 section "schema & fixture data"
 cql "
@@ -620,6 +658,137 @@ check "production-shaped rows are physically gone once their chunk is removed" \
 check "...and the statics are still there, because the range delete never reached them" \
     "SELECT site_id, tag_name FROM it.tm_tag_point WHERE tag_id='TAG-001';" \
     'S1 \| +boiler\.temp'
+
+section "TimeSeriesCompactionStrategy: window split and freeze"
+# TSCS is otherwise absent from this gate -- every other table here is on UCS or the default -- so a
+# regression in window classification, the flush-time split (T3) or the freeze (T2) that only shows
+# up through the packaged image would reach a release unseen. docker/cluster-test.sh covers TSCS on
+# three replicas, but it is manual in CI and explicitly not a release gate.
+#
+# Windows are one minute wide and freeze a minute after closing. Every write carries an explicit
+# USING TIMESTAMP (microseconds, TSCS's configured resolution) minutes in the past, so which window
+# a row lands in is fixed by this script rather than by the wall clock when it runs.
+TSCS_W0=$(( (NOW_MS / 60000 - 20) * 60000 ))     # first window start, 20 minutes ago
+TSCS_WINDOWS=3
+TSCS_FLUSHES=3
+
+cql "
+CREATE TABLE IF NOT EXISTS it.tscs (
+    tag text, ts timestamp, value double,
+    PRIMARY KEY (tag, ts)
+) WITH compaction = {'class':'TimeSeriesCompactionStrategy',
+                     'timestamp_resolution':'MICROSECONDS',
+                     'window_size':'1m','freeze_after':'1m'};
+" > /dev/null
+sleep 3
+
+check "TSCS is the table's compaction strategy" \
+    "SELECT compaction FROM system_schema.tables WHERE keyspace_name='it' AND table_name='tscs';" \
+    'TimeSeriesCompactionStrategy'
+
+# Several flushes, each writing into every window, so each closed window really starts out as
+# several sstables and the freeze has something to do.
+for f in $(seq 0 $((TSCS_FLUSHES - 1))); do
+    STMTS=""
+    for w in $(seq 0 $((TSCS_WINDOWS - 1))); do
+        WS=$(( TSCS_W0 + w * 60000 ))
+        TS_MS=$(( WS + f * 1000 ))
+        STMTS="$STMTS INSERT INTO it.tscs (tag, ts, value) VALUES ('tag-$f', $TS_MS, $w) USING TIMESTAMP $(( TS_MS * 1000 ));"
+    done
+    cql "$STMTS" > /dev/null
+    ntool flush it tscs > /dev/null
+done
+
+sstable_count() { ntool tablestats "it.$1" | grep -E '^[[:space:]]+SSTable count:' | head -1 | tr -dc '0-9'; }
+
+# T3: the flush split at window boundaries, so no sstable spans two windows and there is at least
+# one per window. A flush that ignored the boundaries would produce fewer.
+TSCS_AFTER_FLUSH=$(sstable_count tscs)
+assert "flush split at window boundaries (>= one sstable per window)" \
+    "$([ "${TSCS_AFTER_FLUSH:-0}" -ge "$TSCS_WINDOWS" ] && echo ">= $TSCS_WINDOWS" || echo "${TSCS_AFTER_FLUSH:-<none>}")" \
+    ">= $TSCS_WINDOWS"
+
+# T2: each closed window compacts down to exactly one sstable. This is background work, so it is
+# waited for rather than asserted immediately -- but the wait is bounded, and a node that never
+# converges answers every CQL read correctly and simply keeps its disk, which is precisely why it
+# needs an assertion of its own.
+printf '   waiting for freeze convergence'
+TSCS_CONVERGED=0
+for _ in $(seq 1 24); do
+    TSCS_N=$(sstable_count tscs)
+    [ "${TSCS_N:-0}" = "$TSCS_WINDOWS" ] && { TSCS_CONVERGED=1; break; }
+    printf '.'; sleep 5
+done
+echo
+assert "every closed window freezes to exactly one sstable" "${TSCS_N:-<none>}" "$TSCS_WINDOWS"
+
+# ...and then stops. A freeze/split alternation rewrites a converged window forever; it is invisible
+# to every read, and the only observable is that the sstable set keeps changing.
+TSCS_BEFORE=$(ntool tablestats it.tscs | grep -E '^[[:space:]]+(SSTable count|Space used \(live\))')
+sleep 20
+TSCS_AFTER=$(ntool tablestats it.tscs | grep -E '^[[:space:]]+(SSTable count|Space used \(live\))')
+assert "a converged window is not rewritten again (no freeze/split livelock)" \
+    "$([ "$TSCS_BEFORE" = "$TSCS_AFTER" ] && echo stable || echo changed)" stable
+
+check "every row survives the freeze" \
+    "SELECT count(*) FROM it.tscs;" "^ *$((TSCS_WINDOWS * TSCS_FLUSHES))$"
+
+section "restart: everything above survives a real process boot"
+# Every assertion so far ran against a node that has been up the whole time, with schema in memory
+# and data possibly still in memtables. The failure class this covers is the one that only appears
+# when the process starts again and replays what it wrote -- exactly the shape of the chunk-table
+# TCM bug (a committed metadata log entry that could not be parsed back, so the node that wrote it
+# could not replay its own log). The jvm-dtests restart an in-JVM instance; only this restarts a
+# real process through the image's entrypoint, off a real commit log on disk.
+#
+# The tiered tables above cannot be reused: both tiering sections end by DELETING their chunk row,
+# which is the only way a shell script can prove the re-encoder issued its range delete. So this
+# builds its own tiered table and leaves it intact across the restart.
+cql "
+CREATE TABLE IF NOT EXISTS it.restarted (
+    tag_id text, timestamp timestamp, value double,
+    PRIMARY KEY (tag_id, timestamp)
+);
+" > /dev/null
+cql "ALTER TABLE it.restarted WITH extensions = {'timeseries_tiering': '$TIERING_JSON'};" > /dev/null
+cql "
+INSERT INTO it.restarted (tag_id, timestamp, value) VALUES ('pump-09', $(( WIN_MS +  300000 )), 11);
+INSERT INTO it.restarted (tag_id, timestamp, value) VALUES ('pump-09', $(( WIN_MS +  900000 )), 22);
+INSERT INTO it.restarted (tag_id, timestamp, value) VALUES ('pump-09', $(( WIN_MS + 1500000 )), 33);
+" > /dev/null
+check_nodetool "a fresh window is re-encoded before the restart" '' retier it restarted
+check "its chunk row exists before the restart (samples = 3)" \
+    "SELECT samples FROM it.restarted__chunks WHERE tag_id='pump-09' AND window_start=$WIN_MS;" \
+    '^ *3'
+
+$RUNTIME restart "$CONTAINER" > /dev/null 2>&1
+wait_for_cql
+
+check "the node comes back up and still reports 6.0.0" \
+    "SELECT release_version FROM system.local;" '^ *6\.0\.0 *$'
+check "the tiering policy survived the restart" \
+    "SELECT extensions FROM system_schema.tables WHERE keyspace_name='it' AND table_name='restarted';" \
+    'timeseries_tiering'
+check "the chunk table survived the restart" \
+    "SELECT table_name FROM system_schema.tables WHERE keyspace_name='it' AND table_name='restarted__chunks';" \
+    'restarted__chunks'
+check "the chunk row survived the restart (samples = 3)" \
+    "SELECT samples FROM it.restarted__chunks WHERE tag_id='pump-09' AND window_start=$WIN_MS;" \
+    '^ *3'
+check "re-encoded rows still read back through the merge after the restart" \
+    "SELECT count(*) FROM it.restarted WHERE tag_id='pump-09' AND timestamp >= $WIN_MS AND timestamp < $WIN_END_MS;" \
+    '^ *3$'
+check "an aggregate still spans the chunk transparently after the restart" \
+    "SELECT avg(value) FROM it.restarted WHERE tag_id='pump-09' AND timestamp >= $WIN_MS AND timestamp < $WIN_END_MS;" \
+    '^ *22'
+check "the TSCS table still returns every row after the restart" \
+    "SELECT count(*) FROM it.tscs;" "^ *$((TSCS_WINDOWS * TSCS_FLUSHES))$"
+# The frozen windows are on disk, not in a memtable: a restart that re-split or re-merged them would
+# show up here as a different count. Replaying already-flushed data must add nothing.
+assert "frozen sstables come back unchanged (still one per window)" "$(sstable_count tscs)" "$TSCS_WINDOWS"
+check "the SAI index still answers LIKE after the restart" \
+    "SELECT count(*) FROM it.logs WHERE device='pump-01' AND msg LIKE '%timeout%' ALLOW FILTERING;" \
+    '^ *1$'
 
 echo
 echo "== $PASS passed, $FAIL failed =="
