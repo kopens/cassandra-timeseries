@@ -409,19 +409,26 @@ public final class ChunkCoverage
     }
 
     /**
-     * Records, <b>before</b> the chunk is written, that {@code base}'s chunk table is about to hold a
-     * chunk of {@code chunkWindowMillis} covering {@code windowStartMs}, and that nothing this cycle
-     * writes can start later than {@code cutoffMs}.
+     * Records, <b>before</b> the chunks are written, that {@code base}'s chunk table is about to hold
+     * chunks of {@code chunkWindowMillis} covering the windows from {@code minWindowStartMs} to
+     * {@code maxWindowStartMs}.
      * <p>
      * Ordering is the point: the ledger has to be at least as wide as the chunk table at every
      * instant, so it is widened first and the chunk written second. The reverse order would leave a
      * crash window in which a chunk exists that the read path's fast path does not know about -- data
      * whose base rows are already deleted, invisible until the next cycle.
      * <p>
-     * {@code cutoffMs} rather than {@code windowStartMs} for the top: it is the ceiling of everything
-     * this cycle can encode, so one write per cycle claims the whole cycle instead of one write per
-     * window. Over-claiming the top is free (it only costs an unnecessary chunk read), under-claiming
-     * it is exactly the bug this class exists to prevent.
+     * <b>The top must be a window this call actually encodes, never a cycle-wide ceiling.</b> It used
+     * to be the re-encoder's {@code cutoff}, on the reasoning that over-claiming the top is free
+     * because it only costs an unnecessary chunk read. That was true when only the read path consumed
+     * it, and stopped being true when the write guard started sharing the number through
+     * {@link ColdBoundary#coldBelowMs}: there, a top of {@code cutoff} means
+     * {@code topExclusiveMs() == cutoff + chunk_window}, so {@code TieredWrites} refuses tombstones on
+     * a whole {@code chunk_window} of rows that are inside the hot window and were never encoded. With
+     * {@code hot_window == chunk_window} that band runs right up to now and no recent row can be
+     * deleted at all. Staleness is still safe without the over-claim, because {@code coldBelowMs}
+     * floors the answer at the current hot boundary -- a chunk written since this node last read the
+     * ledger is below that floor by definition.
      * <p>
      * A no-op when the claim adds nothing to what is already recorded, which is the steady state.
      *
@@ -431,7 +438,7 @@ public final class ChunkCoverage
      * hides every wider legacy chunk from the read path's look-back.
      */
     public static void claim(TableMetadata base, ConsistencyLevel cl,
-                             long windowStartMs, long cutoffMs, long chunkWindowMillis)
+                             long minWindowStartMs, long maxWindowStartMs, long chunkWindowMillis)
     {
         ConsistencyLevel ledgerCl = ledgerConsistency(cl);
         Coverage current = forTable(base, ledgerCl);
@@ -444,7 +451,7 @@ public final class ChunkCoverage
                 "longer mentions, whose base rows are already deleted. The window is skipped and retried next cycle.",
                 base.keyspace, base.name));
 
-        Coverage widened = current.widenedBy(windowStartMs, cutoffMs, chunkWindowMillis);
+        Coverage widened = current.widenedBy(minWindowStartMs, maxWindowStartMs, chunkWindowMillis);
         if (current.sameAs(widened))
             return;
 

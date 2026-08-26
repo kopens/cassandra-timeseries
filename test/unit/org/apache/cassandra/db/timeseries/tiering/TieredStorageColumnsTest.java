@@ -825,6 +825,30 @@ public class TieredStorageColumnsTest extends CQLTester
     }
 
     /**
+     * The ledger's top is the newest window the cycle actually encoded, never the cycle's cutoff.
+     *
+     * <p>The re-encoder used to claim {@code cutoff} as the top, on the reasoning that over-claiming
+     * only costs an unnecessary chunk read. That held while the read path was the only consumer. The
+     * write guard shares the number through {@link ColdBoundary#coldBelowMs}, and there the overshoot
+     * is a whole {@code chunk_window} of rows that are inside the hot window and were never encoded:
+     * {@code TieredWrites} refuses to tombstone them. With {@code hot_window == chunk_window} the band
+     * reaches to now and no recent row can be deleted at all.
+     *
+     * <p>{@link #chunkOneRow} runs a cycle at {@code now = 5h} with {@code hot_window = 2h}, so the
+     * cutoff is {@code 3h} and the one window encoded starts at {@code 0}. The top must therefore be
+     * {@code 1h} (that window plus its {@code chunk_window}), not {@code 4h}. The row at {@code 4h} is
+     * hot and unencoded, and a top of {@code 4h} is exactly what made it undeletable.
+     */
+    @Test
+    public void theLedgerTopIsTheEncodedWindowNotTheCycleCutoff() throws Throwable
+    {
+        chunkOneRow();
+        ChunkCoverage.invalidateAll();
+        assertEquals("the ledger must not claim past the newest window actually encoded",
+                     HOUR, ChunkCoverage.forTable(baseMetadata(), null).topExclusiveMs());
+    }
+
+    /**
      * The ledger is consulted at quorum strength whatever the asking query's own consistency level
      * is. It cannot be the caller's: the cache is keyed by table alone, so a {@code SELECT} at
      * {@code CL=ONE} that landed on a replica without the ledger row would publish

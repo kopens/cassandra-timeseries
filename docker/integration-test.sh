@@ -638,12 +638,36 @@ check "the rejected deletes changed nothing (all 5 rows still there)" \
     "SELECT count(*) FROM it.tm_tag_point WHERE tag_id='TAG-001';" \
     '^ *5'
 
-# ...and a write inside the hot window is untouched by the rule.
+# ...and a write inside the hot window is untouched by the rule. Two rows, because the interesting
+# one is not the obvious one.
+#
+# NOW2 is read fresh rather than reusing NOW_MS: this runs minutes after the tiering section began,
+# and the guard compares against the CURRENT hot boundary.
+NOW2_MS=$(date +%s%3N)
+# The ordinary case: a row written just now.
+# The worst case: the last millisecond before the current chunk_window boundary. It is always inside
+# the hot window (at most one chunk_window old, and hot_window == chunk_window == 1h here), yet it is
+# the newest row a coverage ledger that claimed the CYCLE CUTOFF as its top would call cold -- such a
+# ledger reports top = alignDown(now - hot_window) + chunk_window = alignDown(now), and this row sits
+# one millisecond below that. Picking the timestamp this way rather than "now" is what makes the
+# check deterministic: with "now" it only reproduced when the test happened to run in the first
+# minutes of an hour, which is how the bug survived two green runs before a third caught it.
+HOT_EDGE_MS=$(( (NOW2_MS / 3600000) * 3600000 - 1 ))
 cql "INSERT INTO it.tm_tag_point (tag_id, timestamp, latency, quality, value)
-          VALUES ('TAG-001', $NOW_MS, 9, 192, '25.0');" > /dev/null
+          VALUES ('TAG-001', $NOW2_MS, 9, 192, '25.0');
+     INSERT INTO it.tm_tag_point (tag_id, timestamp, latency, quality, value)
+          VALUES ('TAG-001', $HOT_EDGE_MS, 8, 192, '25.1');" > /dev/null
 check "a DELETE inside the hot window still works" \
-    "DELETE FROM it.tm_tag_point WHERE tag_id='TAG-001' AND timestamp = $NOW_MS;
-     SELECT count(*) FROM it.tm_tag_point WHERE tag_id='TAG-001' AND timestamp = $NOW_MS;" \
+    "DELETE FROM it.tm_tag_point WHERE tag_id='TAG-001' AND timestamp = $NOW2_MS;
+     SELECT count(*) FROM it.tm_tag_point WHERE tag_id='TAG-001' AND timestamp = $NOW2_MS;" \
+    '^ *0$'
+# If this one fails and the one above passes, the write guard is refusing rows the re-encoder never
+# touched -- look at what the coverage ledger claims as its top, not at the hot window.
+# (It shares one race with every other wall-clock assertion here: if the hour turns between the
+# INSERT and the DELETE, this row really has aged out of the hot window. ~2s in 3600.)
+check "a DELETE just below the chunk_window boundary still works (hot, never encoded)" \
+    "DELETE FROM it.tm_tag_point WHERE tag_id='TAG-001' AND timestamp = $HOT_EDGE_MS;
+     SELECT count(*) FROM it.tm_tag_point WHERE tag_id='TAG-001' AND timestamp = $HOT_EDGE_MS;" \
     '^ *0$'
 
 # Same deletion gate as above, on the shape that matters: with the chunk removed, a base table that

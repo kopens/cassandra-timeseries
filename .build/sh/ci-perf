@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Performance REGRESSION gate for the chunk codec and cursor: runs the JMH classes and compares
+# them with the recorded baseline, failing when something got materially slower.
+#
+#   .build/sh/ci-perf                 # measure and compare
+#   .build/sh/ci-perf --record        # measure and OVERWRITE the baseline (see below)
+#   PERF_THRESHOLD=15 .build/sh/ci-perf   # tighten the allowed regression (default 25%)
+#
+# This is a gate, not a benchmark. docker/scale-test.sh and docker/tiering-bench.sh answer
+# "how fast on production-shaped data"; they take hours and need a 16G heap. This answers the much
+# narrower "did a change make the decode path slower", in minutes, so it can run before a release.
+#
+# Two things it will not do, on purpose:
+#
+#   * It will not compare across hosts. The baseline records the machine it was taken on, and a run
+#     elsewhere reports every number but refuses to fail the build on them -- a 4114T and a Haswell
+#     E5-2676 v3 differ by more than any threshold worth setting, and a gate that cries wolf on
+#     hardware gets ignored exactly when it is right.
+#   * It will not record a new baseline as a side effect of a regression. --record is explicit,
+#     because "the numbers moved so I moved the line" is how a perf gate quietly stops existing.
+set -o errexit -o nounset -o pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
+cd "$REPO"
+
+BASELINE="${PERF_BASELINE:-doc/timeseries/perf-baseline.json}"
+THRESHOLD="${PERF_THRESHOLD:-25}"
+RESULT=build/test/output/jmh-result.json
+RECORD=false
+# One JMH invocation per class: the runner takes a regex, and a single one matching all of them
+# would also sweep up unrelated microbenches.
+CLASSES="${PERF_CLASSES:-ChunkReadBench ChunkBlockDecodeBench ChunkBitUnpackBench ChunkPresenceBench}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --record) RECORD=true; shift ;;
+    -h|--help) sed -n '18,40p' "$0"; exit 0 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+merged=build/test/output/jmh-merged.json
+mkdir -p "$(dirname "$merged")"
+: > "$merged.parts"
+
+for class in $CLASSES; do
+  echo "-- $class"
+  rm -f "$RESULT"
+  "$HERE"/ai-in-container "ant microbench -Dbenchmark.name=$class -Dant.gen-doc.skip=true -Drat.skip=true -Dno-checkstyle=true" \
+    | grep -E '^\s+\[java\] (Benchmark|Chunk)' || true
+  [ -f "$RESULT" ] || { echo "FATAL: $class produced no jmh-result.json -- it did not run" >&2; exit 1; }
+  cat "$RESULT" >> "$merged.parts"
+done
+
+python3 - "$merged.parts" "$merged" "$BASELINE" "$THRESHOLD" "$RECORD" <<'PY'
+import json, os, socket, sys
+
+parts_path, merged_path, baseline_path, threshold, record = sys.argv[1:6]
+threshold = float(threshold)
+record = record == "true"
+
+# Each ant run wrote a complete JSON array; the parts file is those arrays concatenated.
+runs, decoder, text = [], json.JSONDecoder(), open(parts_path).read()
+idx = 0
+while idx < len(text):
+    while idx < len(text) and text[idx].isspace():
+        idx += 1
+    if idx >= len(text):
+        break
+    value, idx = decoder.raw_decode(text, idx)
+    runs.extend(value)
+
+measured = {}
+for r in runs:
+    name = r["benchmark"].rsplit(".", 1)[-1]
+    cls = r["benchmark"].rsplit(".", 2)[-2]
+    measured[f"{cls}.{name}"] = {
+        "score": r["primaryMetric"]["score"],
+        "error": r["primaryMetric"]["scoreError"],
+        "unit": r["primaryMetric"]["scoreUnit"],
+    }
+
+host = socket.gethostname()
+json.dump({"host": host, "benchmarks": measured}, open(merged_path, "w"), indent=2, sort_keys=True)
+
+if record:
+    json.dump({"host": host, "benchmarks": measured}, open(baseline_path, "w"), indent=2, sort_keys=True)
+    print(f"\nbaseline recorded on {host}: {baseline_path} ({len(measured)} benchmarks)")
+    raise SystemExit(0)
+
+if not os.path.exists(baseline_path):
+    print(f"\nNo baseline at {baseline_path}. Measured {len(measured)} benchmarks on {host}:")
+    for k, v in sorted(measured.items()):
+        print(f"  {k:44s} {v['score']:10.3f} +/- {v['error']:7.3f} {v['unit']}")
+    print("\nRecord it with: .build/sh/ci-perf --record")
+    raise SystemExit(0)
+
+base = json.load(open(baseline_path))
+same_host = base.get("host") == host
+print(f"\nbaseline host {base.get('host')} | this host {host}"
+      + ("" if same_host else "  -- DIFFERENT, reporting only, not gating"))
+print(f"{'benchmark':44s} {'baseline':>12s} {'now':>12s} {'delta':>9s}")
+
+regressions, missing = [], []
+for name, b in sorted(base["benchmarks"].items()):
+    m = measured.get(name)
+    if m is None:
+        missing.append(name)
+        continue
+    delta = (m["score"] - b["score"]) / b["score"] * 100.0
+    flag = ""
+    # Higher is worse for avgt/sample (time per op); lower is worse for thrpt (ops per unit time).
+    worse = delta if "ops" not in b["unit"] else -delta
+    if worse > threshold:
+        flag = "  <== REGRESSION"
+        regressions.append((name, worse))
+    print(f"{name:44s} {b['score']:12.3f} {m['score']:12.3f} {delta:+8.1f}%{flag}")
+
+for name in missing:
+    print(f"{name:44s} {'--':>12s} {'MISSING':>12s}      -- benchmark disappeared")
+
+if missing:
+    print(f"\nFAIL: {len(missing)} benchmark(s) in the baseline did not run. Either they were renamed"
+          "\n(re-record the baseline in the same commit) or the run silently covered less than it claims.")
+    raise SystemExit(1)
+
+if regressions and same_host:
+    print(f"\nFAIL: {len(regressions)} benchmark(s) slower than the baseline by more than {threshold:.0f}%:")
+    for name, worse in regressions:
+        print(f"  {name}  {worse:+.1f}%")
+    print("\nIf the change is a deliberate trade, say so and re-record with .build/sh/ci-perf --record.")
+    raise SystemExit(1)
+
+if regressions:
+    print(f"\n{len(regressions)} benchmark(s) beyond the threshold, NOT failing the build: the baseline"
+          "\nwas taken on a different host, so this is a hardware difference until measured there.")
+
+print("\nci-perf: no regression beyond the threshold." if same_host else "\nci-perf: reported only (host mismatch).")
+PY

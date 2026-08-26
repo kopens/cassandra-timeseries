@@ -1,156 +1,188 @@
 ---
 name: docker-integration-test
-description: Run this fork's container-based end-to-end tests — the single-node CQL release gate (docker/integration-test.sh) and the three-node RF=3 cluster test (docker/cluster-test.sh) — plus the scale and tiering benchmarks. Use this whenever the user asks to run integration tests, e2e tests, the release gate, "도커로 테스트", "통합 테스트 돌려줘", "클러스터 테스트", or wants to verify time-series functions / tiered storage / TSCS against a real node rather than in-JVM. Also use it when deciding which of these to run after a change, or when one of them fails and the failure needs diagnosing.
+description: The pre-release verification procedure for this fork — the full local gate (.build/sh/ci-local), the three-node cluster test, the performance regression gate, and the trial-run protocol that must precede enabling tiered storage on real data. Use this whenever the user asks to run integration or e2e tests, to verify a build, to check whether something is ready to ship or "문제없나 / 출시해도 되나 / 프로덕션 써도 되나", before cutting a release tag, and whenever a change touches tiering, compaction, the chunk codec or the read path. Also use it when one of these runs fails and the failure needs diagnosing.
 ---
 
-# Container-based integration testing
+# Verifying a build before it ships
 
-The jvm-dtests under `org.apache.cassandra.distributed.test.timeseries.*` cover the distributed
-invariants in one JVM and run on every push. These scripts are the counterpart that runs the same
-invariants through a **real node from the published image** — real schema, real native protocol,
-real cqlsh output, real sstables on disk. They catch a class of regression the in-JVM tests
-structurally cannot: anything that only shows up once the code is packaged, started by the
-entrypoint, and driven from outside the process.
+The jvm-dtests cover the distributed invariants in one JVM and run on every push. Everything here
+runs the same invariants through a **real node built from the image that will actually ship**, which
+is the only way to catch what appears once the code is packaged, started by the entrypoint and
+driven from outside the process.
 
-## Build the image first
+Treat this as a checklist, not a menu. The features it covers — tiered storage above all — delete
+base rows and cannot be rolled back, so "we ran the unit tests" is not a release decision.
 
-Everything here consumes `docker/Dockerfile`, which compiles the repo in a builder stage — so the
-image *is* the thing under test and must be rebuilt after any source change:
+## 0. Know what CI is and is not telling you
 
-```bash
-docker build --network host -t cassandra-timeseries:6.0.0 -f docker/Dockerfile .
-```
-
-`--network host` is required: Docker's default bridge has no DNS resolution on this host, so
-`apt-get` inside the build fails to resolve `archive.ubuntu.com`. Takes ~5 minutes.
-
-When testing an uncommitted or in-progress change, tag it distinctly (`:6.0.0-<topic>`) and pass
-that tag to the scripts, so a stale `:6.0.0` can't be silently tested instead.
-
-## Which one to run
-
-| Script | Cost | What it uniquely proves |
-|---|---|---|
-| `docker/integration-test.sh` | ~8 min, 1 container | Every time-series function family, gap-fill, SAI LIKE, the whole tiered-storage lifecycle, TSCS freeze, and that all of it survives a real process restart |
-| `docker/cluster-test.sh` | ~15 min, 3 containers × 2G heap | Coordinator fan-out, per-replica TSCS convergence, repair streaming between OS processes, QUORUM with a replica down |
-| `docker/scale-test.sh` | hours, 16G heap, 20M rows | Query latency on a production-shaped dataset (untiered baseline) — a benchmark, not a gate |
-| `docker/tiering-bench.sh` | hours, needs scale-test's dataset | Storage ratio and read latency *after* tiering, comparable to that baseline |
-| `docker/soak-workload.py` | days | Slow leaks and drift that no single run can see |
-
-Default to `integration-test.sh`. Add `cluster-test.sh` when the change touches compaction,
-streaming, repair, tiering, or anything a coordinator does — that is where the two diverge. The
-benchmarks are for answering "how fast", never "is it correct"; don't run them as a verification
-step, they take hours and need a 16G heap and a host bind-mount.
-
-## Running
-
-For the whole gate — build the jar, run the fork's test classes, build the image, run the
-integration test, in `.gitlab-ci.yml`'s own order — use the one wrapper:
+The project's GitLab runners have been offline since at least 2026-08-07. Every pipeline since fails
+with `stuck_pending_no_matching_runners` — the jobs never start. A red pipeline currently says
+nothing about the code, and a green one has not existed in weeks.
 
 ```bash
-.build/sh/ci-local                 # add --with-cluster for the 3-node test
-.build/sh/ci-local --stage image   # or one stage: jar | tests | image | integration | cluster
+glab ci list --per-page 5
+glab ci get -p <id>            # failure_reason on the jobs
+glab api projects/common%2Fcassandra-timeseries/runners
 ```
 
-It tags the image by commit so a run cannot silently test something left behind under
-`cassandra-timeseries:6.0.0`, and it fails if the jar predates the run rather than trusting ant's
-log. Prefer it over driving the scripts by hand — and note that **it is currently the only thing
-that verifies anything**: the project's GitLab runners have been offline since at least 2026-08-07,
-so every pipeline fails with `stuck_pending_no_matching_runners` before a job starts.
+Check this before quoting CI as evidence, and say plainly which of the runs below you actually did.
+Per CLAUDE.md, all GitLab work goes through `glab`.
 
-To drive one script directly against an image you already have:
+## 1. The gate — `.build/sh/ci-local`
+
+Walks `.gitlab-ci.yml`'s stages in order on this machine: jar + checkstyle, the fork's test classes,
+the docker image, the integration test.
 
 ```bash
-./docker/integration-test.sh cassandra-timeseries:6.0.0
-./docker/cluster-test.sh     cassandra-timeseries:6.0.0
+.build/sh/ci-local                  # add --with-cluster to include stage 2 below
+.build/sh/ci-local --stage image    # one stage: jar | tests | image | integration | cluster
 ```
 
-Both exit non-zero if any assertion failed, print one line per assertion with the CQL that ran and
-the rows that came back, and write an HTML report (`build/timeseries-it-report.html`,
-`build/timeseries-cluster-report.html`) that is kept as a CI artifact.
+It tags the image by commit, so a run cannot silently verify something left behind under
+`cassandra-timeseries:6.0.0`, and it fails if the jar predates the run — `ant` reports success
+without building when it is missing from PATH, and `ant-log-summary.py` prints `BUILD SUCCESSFUL` on
+empty input, so a green log is not evidence on its own.
 
-They take minutes; start them in the background and do other work while they run. Note that
-`cluster-test.sh` deliberately **leaves its three containers running** so a failure can be
-inspected — it prints the `docker rm -f` line to clean up, and removes them itself on the next run.
+Stages are strictly serial, and runs must not overlap: `ci-test` begins with a `realclean`, so a
+second run deletes the first's resolved dependencies under `build/lib/jars` and the victim fails
+with hundreds of `package org.slf4j does not exist` errors that read as a broken change and are not.
 
-`CONTAINER_RUNTIME=podman` works for both. `READY_TIMEOUT` (default 300s) is the per-node wait for
-CQL; raise it on a loaded machine rather than concluding the node is broken.
+## 2. The cluster test — required before a release, not optional
 
-## What they assert (so you know what a pass actually buys)
+```bash
+./docker/cluster-test.sh cassandra-timeseries:<tag>     # or ci-local --with-cluster
+```
 
-**`integration-test.sh`** — 92 assertions against hand-computed values on a deterministic fixture:
+`.gitlab-ci.yml` marks `docker-cluster-test` manual and explicitly not a release gate, on the
+argument that three 2G JVMs plus the job may not fit a shared runner. That argument is about runner
+capacity, not about risk — and it leaves the only coverage of tiering's *cluster* invariants outside
+every gate:
 
-- the version the node reports, so a run against a stale `:6.0.0` image cannot pass as a run
-  against the change under test — and so an upstream merge that reset `base.version` to an alpha
-  would land here
+- each tag encoded exactly once across the cluster (every node re-encodes only its own primary
+  ranges, so all three have to run and none may double-encode);
+- TSCS freezing each closed window to one sstable **on every replica independently** — compaction is
+  node-local, and a node that never converged answers every read correctly while keeping its disk;
+- a real repair stream between operating-system processes, and the window-split layout of what the
+  receiving node ends up with;
+- aggregation and gap-fill computed by each coordinator in turn.
+
+Run it on a machine with the headroom, once, before any release that touches compaction, streaming,
+repair or tiering. It leaves its three containers up on purpose so a failure can be inspected;
+`docker rm -f cassandra-ts-cluster-{1,2,3}` when done.
+
+## 3. The performance gate — `.build/sh/ci-perf`
+
+```bash
+.build/sh/ci-perf                   # compare against doc/timeseries/perf-baseline.json
+.build/sh/ci-perf --record          # deliberately move the line (see below)
+```
+
+Runs the chunk codec and cursor JMH classes and fails on a regression beyond the threshold (25% by
+default). It is a *regression* gate, not a benchmark: `docker/scale-test.sh` and
+`docker/tiering-bench.sh` answer "how fast on production-shaped data" and take hours with a 16G heap.
+
+Two rules it enforces so the gate keeps meaning something:
+
+- **It refuses to gate across hosts.** The baseline records the machine it was taken on; elsewhere it
+  reports every number and fails nothing. A 4114T and a Haswell E5-2676 v3 differ by more than any
+  useful threshold, and a gate that cries wolf on hardware gets ignored exactly when it is right.
+  The same applies to quoting numbers: every figure in `doc/timeseries/*` is from host 234, and the
+  production node is 41.
+- **`--record` is explicit and never automatic.** "The numbers moved so I moved the line" is how a
+  perf gate quietly stops existing. Re-record only for a deliberate trade, in the same commit as the
+  change, and say so in the message.
+
+## 4. Before enabling tiered storage on real data
+
+Tiering deletes the base rows. From that moment `<table>__chunks` is the only copy, a build that
+cannot read v4 chunks cannot read the data, and dropping the chunk table destroys it. Read
+[production-rollout.md](../../../doc/timeseries/production-rollout.md) §0 in full — it is short and
+every item is a one-way door.
+
+Do not skip the trial run:
+
+1. **Every node on a v4 build first.** v4 chunks are unreadable by older builds and v1/v2/v3 chunks
+   are unreadable by this one, with no converter. Any chunk table left by an older build must be
+   `DROP`ped before enabling — that data does not come back.
+2. **A table whose data can be regenerated**, or a copy, for at least a full retention cycle. Long
+   enough that the re-encoder, cold-window expiry and at least one node restart have all happened.
+3. **Restart a node during the trial** and confirm it comes back and still serves the merged view.
+   The chunk-table TCM bug was invisible until a node replayed its own metadata log.
+4. **Confirm backups include `<table>__chunks`** before the first re-encode, not after.
+5. **Watch `system_views.timeseries_tiering`** and the ledger through the trial rather than only at
+   the end — a cycle that stops making progress is the signal, and it is silent otherwise.
+
+Only then consider a real table, one table at a time.
+
+## What the runs assert
+
+**`docker/integration-test.sh`** — assertions against hand-computed values on a deterministic
+fixture:
+
+- the version the node reports, so a run against a stale image cannot pass as a run against the
+  change under test, and an upstream merge that reset `base.version` lands here
 - every scalar/aggregate family: `time_bucket`, `first`/`last`/`delta`/`rate`/`derivative`,
   reset-aware `counter_delta`/`counter_rate`, `percentile`/`variance`/`stddev`/`histogram`/
-  `approx_count_distinct`, `integral`/`time_weighted_average`, and the two-variable regression set
-  on a known `y = 2x + 1`
+  `approx_count_distinct`, `integral`/`time_weighted_average`, and the regression set on `y = 2x + 1`
 - gap-fill: bucket materialisation, `locf` (including that it leaves pre-first buckets null) and
   `interpolate` (including the trailing bucket)
 - SAI `LIKE` with `index_analyzer`: substring, prefix, suffix, Korean fragments including one that
-  crosses a space, that `=` keeps exact semantics on the analyzed column, and that `LIKE` composes
-  with `time_bucket`
-- tiered storage end to end, twice: once on the simplest shape and once on **`tm_tag_point`'s exact
-  production shape** (7 statics, 7 regular columns across text/int/double/boolean and a frozen map,
-  DESC clustering) — policy install, `nodetool retier`, chunk creation, transparent merged reads,
-  late-row merge, statics surviving the range delete, DESC bound arithmetic in both directions and
-  both orderings, cold-write rejection, and `system_views.timeseries_tiering`
+  crosses a space, that `=` keeps exact semantics on the analyzed column, and composition with
+  `time_bucket`
+- tiered storage end to end, twice: on the simplest shape and on **`tm_tag_point`'s exact production
+  shape** (7 statics, 7 regular columns across text/int/double/boolean and a frozen map, DESC
+  clustering) — policy install, `nodetool retier`, chunk creation, transparent merged reads, late-row
+  merge, statics surviving the range delete, DESC bound arithmetic both directions and both
+  orderings, cold-write rejection, and `system_views.timeseries_tiering`
+- TSCS: the flush split at window boundaries (T3), each closed window freezing to exactly one sstable
+  (T2), that a converged window is then *not* rewritten again — a freeze/split livelock is invisible
+  to every read and only shows as an sstable set that keeps changing — and that no row was lost
+- a **restart** through the image's entrypoint, re-asserting the tiering policy, chunk table, chunk
+  row, merged reads, aggregates, the TSCS sstable layout and the SAI index on the other side
 
-- TSCS: that the flush split at window boundaries (T3), that each closed window freezes to exactly
-  one sstable (T2), that a converged window is then *not* rewritten again — a freeze/split livelock
-  is invisible to every read, its only observable is that the sstable set keeps changing — and that
-  no row was lost doing it
-- a **restart**: the container is restarted through the image's entrypoint and the tiering policy,
-  chunk table, chunk row, merged reads, aggregates, TSCS sstable layout and the SAI index are all
-  asserted again on the other side. The jvm-dtests restart an in-JVM instance; only this one
-  restarts a real process off a real commit log, which is the shape the chunk-table TCM bug had
+Two things to know before editing that script:
 
-The restart section builds its **own** tiered table rather than reusing the ones above, because
-both tiering sections end by deleting their chunk row (see the deletion gate below) — there would
-be nothing left to reconstruct. Keep it that way if you extend it.
+**The deletion gate.** Every other tiering assertion passes whether or not the re-encoder actually
+deleted the base rows, because transparent reads reconcile chunk rows with live base rows either
+way. So the section ends by deleting the chunk row and asserting the window then returns *nothing* —
+the one signal from cqlsh the merge cannot fabricate. If you add a tiering assertion, ask whether it
+would survive the re-encoder silently skipping its range delete. If it would, it is not testing what
+you think. (This is also why the restart section builds its own tiered table: the earlier ones have
+no chunk left to come back from.)
 
-The tiering section ends with a **deletion gate** worth understanding before you touch it: every
-other tiering assertion passes whether or not the re-encoder actually deleted the base rows, because
-transparent reads reconcile chunk rows with live base rows either way. So it deletes the chunk row
-and asserts the window then returns *nothing* — the one signal from cqlsh that the merge cannot
-fabricate. If you add a tiering assertion, ask yourself whether it would survive the re-encoder
-silently skipping its range delete; if it would, it is not testing what you think.
+**Wall-clock assertions must be pinned to the worst case, not to "now".** The hot-window DELETE
+checks use the last millisecond before the current `chunk_window` boundary, because that is the
+newest row a coverage ledger claiming the cycle cutoff as its top would call cold. Written against
+`now` it only reproduced when the test happened to run in the first minutes of an hour — which is
+how a real write-guard bug survived two green runs before a third caught it. Any new assertion that
+depends on where `now` sits inside a window needs the same treatment.
 
-**`cluster-test.sh`** — 12 assertions plus per-coordinator sweeps:
-
-- one schema version across three nodes after formation
-- aggregation and gap-fill asserted through **every** coordinator (a right answer on node 1 says
-  nothing about node 2)
-- TSCS freezes each closed window down to exactly one sstable **on every replica independently**,
-  and a converged window is not rewritten again (freeze/split livelock guard)
-- a real repair stream between two OS processes, with the receiving node then serving the rows
-- writes and reads at QUORUM with one replica actually stopped
-- tiering across three replicas: each tag encoded exactly once cluster-wide, merged reads correct
-  from every node
+**`docker/cluster-test.sh`** — the cluster invariants listed in §2, plus one schema version across
+three nodes and QUORUM behaviour with a replica actually stopped.
 
 ## Diagnosing a failure
 
-The scripts print the exact CQL and the exact rows for every assertion, so start by reading the
-failing block rather than re-running. Then:
+The scripts print the exact CQL and the exact rows for every assertion, so read the failing block
+before re-running. Then:
 
-- **Node never became ready** — `docker logs <container>` (the script tails 40 lines itself). Usually
-  the image, not the test: a broken build, or a schema/startup change.
+- **Node never became ready** — `docker logs <container>`. Usually the image, not the test.
 - **A CQL assertion fails** — reproduce by hand against the still-running container
   (`docker exec <c> cqlsh -e '<the CQL from the report>'`) before changing anything.
 - **A tiering assertion fails** — check `system_views.timeseries_tiering` for whether the cycle ran
-  at all; a policy that failed to install makes every downstream assertion fail confusingly.
-- **A cluster assertion fails** — the containers are still up. `nodetool status`, `nodetool
-  tablestats`, and the per-node sstable listing the script used are all still reachable.
+  at all; a policy that failed to install makes every downstream assertion fail confusingly. If a
+  write was refused as cold, compare the boundary in the error message against what the coverage
+  ledger claims — the guard and the read path share `ColdBoundary.coldBelowMs`, and an overstated
+  ledger top refuses rows that were never encoded.
+- **A cluster assertion fails** — the containers are still up: `nodetool status`, `nodetool
+  tablestats`, and the per-node sstable listing are all still reachable.
 
 Distinguish a *product* failure from a *capacity* failure honestly. Three 2G JVMs plus the test on a
-busy host can time out on readiness or on compaction convergence without anything being wrong; that
-is why `cluster-test.sh` is manual in CI rather than a release gate. Say which one you think it is,
-and why.
+busy host can time out on readiness or on compaction convergence with nothing wrong. Say which one
+you think it is, and why.
 
 ## Reporting back
 
-Give the assertion counts (`N passed, M failed`), name the failing sections, and point at the HTML
-report. If you rebuilt the image, say which tag you tested — testing a stale `:6.0.0` is the easiest
-way to report a green run that means nothing.
+Give the assertion counts, name the failing sections, and point at the HTML reports
+(`build/timeseries-it-report.html`, `build/timeseries-cluster-report.html`). Say which image tag you
+tested — testing a stale one is the easiest way to report a green run that means nothing. If asked
+whether something is ready to ship, answer against this checklist and name what you did **not** run.

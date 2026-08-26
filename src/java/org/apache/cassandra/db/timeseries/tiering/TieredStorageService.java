@@ -938,7 +938,10 @@ public class TieredStorageService implements TieredStorageServiceMBean
                     // a chunk whose base rows are gone and which the fast path does not know to look
                     // for. Claimed on every window, not only on windows that write a chunk, so a lost
                     // or truncated ledger is rebuilt by the next cycle over already-encoded data.
-                    ChunkCoverage.claim(base, cl, windowStart, cutoff, policy.chunkWindowMillis);
+                    // windowStart on BOTH ends, not `cutoff` for the top: the ledger's top feeds the
+                    // write guard as well as the read path, and there over-claiming refuses tombstones
+                    // on hot rows this cycle never encoded (see ChunkCoverage.claim).
+                    ChunkCoverage.claim(base, cl, windowStart, windowStart, policy.chunkWindowMillis);
 
                     ByteBuffer payload = ColumnarChunkCodec.encode(tsBuf, count, columns);
                     // Read the version byte back out of the payload rather than naming a codec
