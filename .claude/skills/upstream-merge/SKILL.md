@@ -1,0 +1,193 @@
+---
+name: upstream-merge
+description: Merge the latest apache/cassandra `cassandra-6.0` upstream into this fork's `main`, resolve the recurring conflicts, build, and run the fork's test suite. Use this whenever the user asks to sync, update, catch up, rebase, or merge with upstream Cassandra — including phrasings like "업스트림 반영하자", "apache/cassandra 최신거 가져와", "cassandra-6.0 머지", or when they paste a github.com/apache/cassandra link and ask to pull it in. Also use it when a merge from upstream is already half-done and conflicts need resolving.
+---
+
+# Merging upstream apache/cassandra into this fork
+
+This fork tracks `apache/cassandra`'s `cassandra-6.0` branch on `main`. The merge itself is
+routine; what makes it error-prone is that a handful of files conflict *every single time* in
+the same way, and that the repo's own build wrapper reports success on this host without
+building anything. Both are covered below.
+
+Work directly on `main` unless the user asks otherwise — that is where the tracking rule in
+`CLAUDE.md` says upstream must land.
+
+## 1. Fetch upstream
+
+The `upstream` remote is not always configured (a fresh clone won't have it):
+
+```bash
+git remote get-url upstream 2>/dev/null || git remote add upstream https://github.com/apache/cassandra.git
+git fetch upstream cassandra-6.0
+```
+
+Then show what is actually new before merging, so you and the user know the size of the change:
+
+```bash
+git log --oneline --no-merges main..upstream/cassandra-6.0
+git rev-list --count main..upstream/cassandra-6.0
+```
+
+If the count is 0, say so and stop — there is nothing to do.
+
+## 2. Merge
+
+```bash
+git merge upstream/cassandra-6.0 --no-edit
+```
+
+Expect conflicts. Resolve them with the playbook below, then `git add` each file. Do **not**
+commit until the build in step 4 passes — a broken merge commit on `main` is much more annoying
+to undo than an uncommitted one.
+
+## 3. Conflict playbook
+
+`CLAUDE.md` lists the recurring conflict spots; this is how each one is actually resolved.
+
+**`README.asc`** — deleted in this fork so GitHub renders `README.md`. Upstream keeps editing it,
+producing a modify/delete conflict. Delete it again: `git rm README.asc`.
+
+**`build.xml`** — upstream resets `base.version` to an alpha/beta (e.g. `6.0-alpha3`). The fork's
+versioning rule requires `6.0.0`, because the build must produce `build/apache-cassandra-6.0.0.jar`
+and the release pipeline renames from that exact path. Keep `<property name="base.version" value="6.0.0"/>`.
+
+**`CHANGES.txt`** — the fork replaced upstream's top version header with `6.0.0` and lists its own
+entries under it. Upstream adds a *new* version section above the old one. Resolve by keeping the
+`6.0.0` header and the fork's entries, appending upstream's new entries (with their
+`Merged from 5.0:` / `Merged from 4.0:` sub-headers intact) below them, and **restoring the version
+header of the section that upstream's new one displaced** — otherwise the older release's entries
+end up looking like they belong to a `Merged from 4.0:` block. Concretely, the shape you want is:
+
+```
+6.0.0
+ * <fork entries, newest first>
+ * <upstream's newest-section entries>
+Merged from 5.0:
+ ...
+Merged from 4.0:
+ ...
+
+
+6.0-alpha2          <- header restored, was the top of upstream's previous section
+ * <older entries, untouched>
+```
+
+**`debian/changelog`** — keep the fork's `cassandra (6.0.0) unstable; urgency=medium` stanza and
+drop upstream's alpha stanza. One gotcha: this file contains a *pre-existing* stray
+`>>>>>>> cassandra-5.0` line (around line 72) that upstream committed years ago. It is not your
+conflict — leave it. Verify with `git show upstream/cassandra-6.0:debian/changelog | grep -n '>>>>>>>'`
+before touching anything that looks like a leftover marker.
+
+**`modules/accord`** — a submodule pointer. Compare the three sides explicitly rather than guessing:
+
+```bash
+git rev-parse HEAD:modules/accord :modules/accord upstream/cassandra-6.0:modules/accord
+```
+
+The fork does not carry its own Accord changes, so take upstream's pointer when they differ, then
+`git submodule update --init --recursive`.
+
+**Fork feature touchpoints** — `SelectStatement.java` (gap-fill wiring), `db/compaction/TimeSeries*.java`,
+`FreezeCompactionTask.java`, `db/compaction/timeseries/`, `TableAttributes.java`, `CassandraDaemon.java`,
+`SystemViewsKeyspace.java`, `NodetoolCommand.java`, `NodeProbe.java`, `DataResolver.java`/`DigestResolver.java`,
+`ColumnFamilyStore.java`/`ColumnFamilyStoreMBean.java`. These usually auto-merge. When they don't, the
+rule is *keep both*: upstream's fix and the fork's feature. Never resolve one of these by taking a
+side wholesale without reading the hunk.
+
+**Upstream-only files with a stale fork delta** — occasionally the fork carries a one-line tweak to a
+pure-upstream file (a test, usually) that upstream has since restructured out of existence. Check
+whether the fork's delta is something *we* authored or an upstream commit that never made it onto
+`cassandra-6.0`:
+
+```bash
+git log --oneline -3 HEAD -- <path>          # who changed it, and why
+git branch -r --contains <that-sha>          # only fork refs => upstream doesn't have it
+```
+
+If the file holds no fork feature and upstream has rewritten it, take theirs
+(`git checkout --theirs <path>`) and say so in the summary. Don't preserve a delta whose reason no
+longer exists.
+
+Before moving on, confirm nothing is left unresolved:
+
+```bash
+git diff --name-only --diff-filter=U
+git grep -n '^<<<<<<< \|^>>>>>>> upstream'
+```
+
+## 4. Build — and why you cannot use `.build/sh/ai-build` here
+
+**This host has no `ant` installed.** `.build/sh/ai-build` pipes ant's output through
+`.build/sh/ant-log-summary.py`, and that script prints `BUILD SUCCESSFUL` and exits 0 when its input
+is empty. So a missing `ant` produces a completely convincing green build that compiled nothing.
+The same trap applies to `ai-ci-test`, which pipes through the same summarizer.
+
+Never treat `BUILD SUCCESSFUL` from those wrappers as evidence on its own. Build in a container
+instead, using the same image CI uses:
+
+```bash
+.claude/skills/upstream-merge/scripts/build-image.sh          # bundled with this skill; idempotent, ~1 min the first time
+.claude/skills/upstream-merge/scripts/in-container.sh 'ant -Dant.gen-doc.skip=true -Drat.skip=true clean jar checkstyle checkstyle-test'
+```
+
+`--network host` is required for both the image build and the runs — Docker's default bridge has no
+working DNS on this host, so `apt-get` inside a plain `docker build` fails to resolve
+`archive.ubuntu.com`. The bundled scripts already pass it.
+
+Confirm the build really happened, by name *and* by timestamp:
+
+```bash
+ls -la --time-style=full-iso build/apache-cassandra-6.0.0.jar
+```
+
+A jar dated before today means it did not rebuild, whatever the log said.
+
+Compile failures after an upstream merge are usually upstream tightening a signature that fork code
+calls. Read the actual error rather than the summary:
+
+```bash
+.claude/skills/upstream-merge/scripts/in-container.sh 'ant -Dant.gen-doc.skip=true -Drat.skip=true build-test 2>&1 | grep -E "error:|error\]"'
+```
+
+Fix fork-side callers to match upstream's new contract, and leave a short comment naming the
+upstream ticket so the next reader knows why the shim exists.
+
+## 5. Test
+
+Run the fork's own CI suite — it is the set of classes that actually cover the fork delta:
+
+```bash
+.claude/skills/upstream-merge/scripts/in-container.sh '.build/sh/ci-timeseries-tests.sh'
+```
+
+It writes one summary line per class and treats "0 tests ran" as a failure, so unlike `ant testsome`
+it cannot pass by silently running nothing. It takes a while; start it in the background and do
+other work while it runs.
+
+For a single class, bypass the summarizer and read the JUnit line yourself:
+
+```bash
+.claude/skills/upstream-merge/scripts/in-container.sh '.build/sh/ci-test <FQCN> 2>&1 | grep -E "Tests run:|BUILD "'
+```
+
+Report results with the actual `Tests run: N, Failures: 0, Errors: 0` lines. If something fails,
+say which class and show the output — do not summarize a failure into a pass.
+
+## 6. Commit
+
+Only after the build and tests are green:
+
+```bash
+git commit --no-edit    # keep git's generated merge message, then amend if the user wants notes
+```
+
+If any conflict was resolved in a way that changed behaviour (taking upstream's version of a file
+the fork had touched, adding a compile shim), mention it in the commit body and in your reply — that
+is the part the user cannot see from the diff stat.
+
+## Reporting back
+
+Tell the user: how many upstream commits landed, which files conflicted and how each was resolved,
+anything that needed a code fix to compile, and the test results. Keep it to a short list — they are
+syncing, not reading a report.

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Runs a command inside the build container, with the repo mounted at its real path.
+#
+#   scripts/in-container.sh 'ant -Dant.gen-doc.skip=true -Drat.skip=true clean jar'
+#   scripts/in-container.sh '.build/sh/ci-timeseries-tests.sh'
+#
+# ANT_OPTS mirrors CI: 4g heap overran the runner cgroup during checkstyle, 3g leaves headroom.
+# HOME=/tmp keeps ant/ivy from trying to write into a root-owned home that isn't mounted.
+set -o errexit -o nounset -o pipefail
+
+IMAGE="${CASSANDRA_BUILD_IMAGE:-cassandra-ai-build:21}"
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)"
+
+if [ "$#" -eq 0 ]; then
+  echo "usage: $(basename "$0") '<shell command to run in the repo root>'" >&2
+  exit 2
+fi
+
+exec docker run --rm --network host \
+  -v "$REPO:$REPO" -w "$REPO" \
+  -e ANT_OPTS="${ANT_OPTS:--Xmx3g}" -e HOME=/tmp \
+  "$IMAGE" bash -lc "$*"

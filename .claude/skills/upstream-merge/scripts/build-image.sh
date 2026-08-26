@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Builds the container image used to compile and test this repo.
+#
+# Why a container at all: this host has no `ant`, and .build/sh/ai-build reports BUILD SUCCESSFUL
+# anyway (its log summarizer prints that on empty input), so a host "build" proves nothing.
+# The image matches .gitlab-ci.yml's: eclipse-temurin:21-jdk + ant.
+#
+# --network host is required: Docker's default bridge has no DNS resolution here, so apt-get
+# inside a plain `docker build` cannot reach archive.ubuntu.com.
+set -o errexit -o nounset -o pipefail
+
+IMAGE="${CASSANDRA_BUILD_IMAGE:-cassandra-ai-build:21}"
+
+if docker image inspect "$IMAGE" > /dev/null 2>&1; then
+  echo "$IMAGE already present"
+  exit 0
+fi
+
+docker build --network host -t "$IMAGE" - <<'DOCKERFILE'
+FROM eclipse-temurin:21-jdk
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends ant ant-optional python3 git \
+ && rm -rf /var/lib/apt/lists/*
+DOCKERFILE
+
+echo "built $IMAGE"
