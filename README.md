@@ -1,22 +1,23 @@
-[English](README.en.md) · [한국어](README.md)
+[English](README.md) · [한국어](README.ko.md)
 
 # cassandra-timeseries
 
-**Apache Cassandra for Industrial Timeseries Workload**
-— 산업 현장의 센서·태그 데이터를 위한 분산 시계열 데이터베이스.
+**Apache Cassandra for industrial time-series workloads** — a distributed time-series database for sensor and tag data from factories and plants.
 
-공장·플랜트의 시계열 데이터는 몇 가지 고유한 성질을 가집니다: 태그(시리즈)마다 초 단위로 끝없이 쌓이고, 몇 년치를 규정상 보관해야 하며, 엣지 장비가 통신 두절 뒤 며칠치를 한꺼번에 밀어 넣고(지각 백필), 조회는 거의 항상 "이 태그의 이 기간"입니다. 범용 Cassandra는 이 워크로드를 감당하지만, 압축·보존·집계는 전부 애플리케이션 몫으로 남습니다.
+Time-series data from industrial sites has a few properties of its own: every tag (series) accumulates endlessly at second resolution, years of it must be retained for compliance, edge devices that lost connectivity push days of backlog in one go (late backfill), and queries are almost always "this tag, this period". Stock Cassandra handles this workload, but compression, retention and aggregation all stay the application's problem.
 
-이 포크는 그 부분을 **데이터베이스 안으로 가져옵니다** — 시계열 연산을 서버에서 끝내고(21종 CQL 함수 + gap-fill), 오래된 데이터를 자동으로 압축·보존하며(계층형 저장 + 시계열 전용 컴팩션), 그러면서도 **CQL은 그대로**입니다. 압축된 과거 데이터도 평범한 `SELECT`로 읽힙니다(투명 읽기). 애플리케이션은 데이터가 압축돼 있는지 알 필요가 없습니다.
+This fork moves that part **into the database** — time-series computation finishes on the server (21 CQL functions plus gap-fill), old data is compressed and expired automatically (tiered storage plus a time-series compaction strategy), and **CQL does not change**. Compressed history reads back through an ordinary `SELECT` (transparent reads). The application never has to know whether the data is compressed.
 
-[apache/cassandra](https://github.com/apache/cassandra)(`cassandra-6.0` 브랜치)의 포크이며, 온디스크 포맷·CQL 문법은 업스트림 그대로라 **기존 6.0 데이터를 그대로 읽습니다**(새 기능은 전부 옵트인). Spark 연동은 짝이 되는 포크 [cassandra-spark-connector](https://dev.kopens.io/common/cassandra-spark-connector)(Spark 4.1.2)로 제공됩니다.
+It is a fork of [apache/cassandra](https://github.com/apache/cassandra) (`cassandra-6.0` branch). The on-disk format and CQL grammar are upstream's, so it **reads existing 6.0 data as-is** — every new feature is opt-in. Spark integration comes from the companion fork [cassandra-spark-connector](https://dev.kopens.io/common/cassandra-spark-connector) (Spark 4.1.2).
 
-## 🎯 핵심 — 무엇이 좋아지나 (업스트림 Cassandra 6.0.0 대비)
+> Deep-dive documents under [doc/timeseries/](doc/timeseries/) are currently written in Korean; [examples.md](doc/timeseries/examples.md) is in English.
 
-**1. 서버에서 끝나는 시계열 연산.** 버킷팅·집계·보간·회귀를 CQL 한 줄로 처리합니다. 애플리케이션이 원시 데이터를 끌어와 계산하던 왕복이 사라집니다.
+## 🎯 What it buys you (against upstream Cassandra 6.0.0)
+
+**1. Time-series computation that finishes on the server.** Bucketing, aggregation, interpolation and regression in one line of CQL. The round trip where the application pulls raw rows and computes them itself disappears.
 
 ```sql
--- 시간별 평균 + 빈 구간 자동 채움 — 업스트림에서는 앱이 100k행을 받아 직접 계산해야 하는 작업
+-- Hourly average with empty buckets filled in — in upstream, the app receives 100k rows and does this itself
 SELECT time_bucket_gapfill(1h, timestamp, '2026-07-01', '2026-07-02'), locf(avg(latency))
 FROM pp.tm_tag_point
 WHERE tag_id='TAG-001' AND timestamp >= '2026-07-01' AND timestamp < '2026-07-02'
@@ -24,116 +25,108 @@ GROUP BY tag_id, time_bucket_gapfill(1h, timestamp, '2026-07-01', '2026-07-02')
 ORDER BY timestamp ASC;
 ```
 
-**2. 오래된 데이터는 자동 압축, 조회는 그대로.** 계층형 저장이 지난 데이터를 컬럼 지향 청크로 압축해 옮기고, `SELECT`는 압축 여부를 몰라도 됩니다(투명 읽기가 자동 병합).
+**2. Old data compresses itself; queries stay the same.** Tiered storage moves past windows into column-oriented chunks, and `SELECT` does not need to know — transparent reads merge them back automatically.
 
-**3. 압축이 조회까지 빠르게 만듭니다 — 저장과 질의 양쪽에서 이깁니다.** 운영 테이블
-형태(`tm_tag_point`, 일반 컬럼 8개) 2,000만 건 실측 — 호스트 234(Xeon Silver 4114T, 40스레드),
-chunk format v4 — [벤치마크 전문](doc/timeseries/tiering-benchmark.md):
+**3. Compression makes queries faster too — it wins on storage *and* latency.** Measured on the production table shape (`tm_tag_point`, 8 regular columns) at 20 million rows — host 234 (Xeon Silver 4114T, 40 threads), chunk format v4 — [full benchmark](doc/timeseries/tiering-benchmark.md):
 
-| 항목 | 계층화 전 | 계층화 후 (v4) | 효과 |
+| Metric | Before tiering | After tiering (v4) | Effect |
 | --- | --- | --- | --- |
-| 저장 용량 | 237.8 MB | **33.3 MB** | **7.1× 절감** (11.9 → ~1.7 B/행) |
-| `count(*)` (4만 행 파티션) | 303 ms | **50 ms** | **6.1× 빠름** |
-| `time_bucket` + 집계 | 150~270 ms | **31~64 ms** | **3~6× 빠름** |
-| gap-fill (locf / interpolate) | 162~284 ms | **30~53 ms** | **5.4× 빠름** |
-| 90개 태그 태그별 p95 (360만 행) | 14.2 s | **2.6 s** | **5.4× 빠름** |
-| 90개 태그 시간별 평균 (360만 행) | 14.9 s | **4.2 s** | **3.5× 빠름** |
-| 1시간 범위 + 컬럼 투영 | 55~56 ms | **30~33 ms** | **1.8× 빠름** |
-| 최신 1,000행 `SELECT *` (시간 범위 없음) | 52~56 ms | **38~45 ms** | 동률 이상 |
-| 재인코딩 처리량 | — | **108k rows/s** | 게이트(50k)의 2.2배 |
+| Storage | 237.8 MB | **33.3 MB** | **7.1× smaller** (11.9 → ~1.7 B/row) |
+| `count(*)` (40k-row partition) | 303 ms | **50 ms** | **6.1× faster** |
+| `time_bucket` + aggregates | 150–270 ms | **31–64 ms** | **3–6× faster** |
+| Gap-fill (locf / interpolate) | 162–284 ms | **30–53 ms** | **5.4× faster** |
+| p95 per tag, 90 tags (3.6M rows) | 14.2 s | **2.6 s** | **5.4× faster** |
+| Hourly average, 90 tags (3.6M rows) | 14.9 s | **4.2 s** | **3.5× faster** |
+| 1-hour range + column projection | 55–56 ms | **30–33 ms** | **1.8× faster** |
+| Newest 1,000 rows, `SELECT *` (no time range) | 52–56 ms | **38–45 ms** | Equal or better |
+| Re-encode throughput | — | **108k rows/s** | 2.2× the design gate (50k) |
 
-> **측정한 모든 질의에서 계층화 후가 같거나 빠릅니다** — 시간 범위 없는 조회·행 단위 조회·static
-> 조회 포함. 시간 범위 없는 `LIMIT` 조회는 질의 방향 순서로(DESC면 최신 창부터) 창을 하나씩
-> 디코드하다 `LIMIT`이 차면 멈추므로 느려지지 않습니다.
+> **Every query measured is the same or faster after tiering** — including unbounded scans, single-row lookups and static-column reads. An unbounded `LIMIT` query decodes windows one at a time in query order (newest first on a `DESC` table) and stops once `LIMIT` is satisfied, so it does not slow down.
 >
-> **`hot_window` 안쪽 질의는 비용이 없습니다** — 콜드 경계 위에서 시작하는 질의는 병합을 건너뛰고
-> 핫 이터레이터를 그대로 돌려줍니다. 위 수치는 전 구간을 콜드로 만든 최대 부하 조건입니다.
+> **A query inside `hot_window` costs nothing** — a query starting above the cold boundary skips the merge entirely and returns the hot iterator unchanged. The figures above are the maximum-load case, with the whole range forced cold.
 >
-> **주의 두 가지.** 파티션 키 없는 풀스캔 집계는 계층화된 테이블에서 오답을 냅니다 — 청크를
-> 병합하지 않는 경로입니다([벤치마크 §주의](doc/timeseries/tiering-benchmark.md) 참고). 그리고
-> 저장 절감 폭은 형태에 좌우됩니다 — 접을 상수·null 컬럼이 없는 최소 형태(고엔트로피 `double`
-> 1컬럼)는 v4 기준 재측정 전이니, 도입 전 자기 테이블 형태로 재보십시오.
+> **Two caveats.** A full-scan aggregate with no partition key returns wrong answers on a tiered table — that path does not merge chunks (see [the benchmark's caveats](doc/timeseries/tiering-benchmark.md)). And the storage saving depends on shape — a minimal shape with no constant or all-null columns to fold (one high-entropy `double`) has not been re-measured on v4, so measure your own table before committing.
 
-**4. 시계열에 맞는 컴팩션·보존.** 시간 창 단위로 SSTable을 정렬·동결(창당 1개)하고, 보존 만료 창은 컴팩션 없이 통째 삭제합니다. 엣지 장비의 지각 백필도 자기 시간대로 자동 격리됩니다.
+**4. Compaction and retention that fit time series.** SSTables are ordered by time window and frozen one-per-window; windows past their retention are dropped whole, without compacting. Late backfill from edge devices is isolated into its own window automatically.
 
-**5. 로그·이벤트 본문 검색.** SAI `LIKE` + `index_analyzer`로 한글 포함 부분문자열 검색이 `ALLOW FILTERING` 없이 동작합니다.
+**5. Full-text search over log and event bodies.** SAI `LIKE` with `index_analyzer` gives real substring matching — Korean included — without `ALLOW FILTERING`.
 
-## ✨ 구현 기능 (업스트림 대비 이 포크의 델타)
+## ✨ What this fork adds
 
-| 기능 | 내용 | 상세 |
+| Feature | Summary | Detail |
 | --- | --- | --- |
-| **시계열 CQL 함수 21종** | `time_bucket`, `first`/`last`, `delta`/`rate`/`derivative`, 리셋 보정 `counter_delta`/`counter_rate`, `percentile`, `time_weighted_average`, `integral`, `variance`/`stddev`, `histogram`, `approx_count_distinct`, 이변량 `corr`/`covar_*`/`regr_*` | [사용법 §2~9](#시계열-cql-사용법) |
-| **Gap-fill** | `GROUP BY time_bucket_gapfill(width, ts, start, finish)` — 빈 버킷 실체화 + `locf()`/`interpolate()` 채움 정책 | [사용법 §3](#3-빈-구간-채우기--time_bucket_gapfill) |
-| **풀텍스트 검색** | SAI `LIKE` + `index_analyzer`(ngram/standard/cjk/keyword + JSON) — 단어 중간 조각·공백 걸침·한글까지 진짜 부분문자열 매치, ALLOW FILTERING 불필요 | [fulltext-search.md](doc/timeseries/fulltext-search.md) |
-| **시계열 컴팩션 (TSCS)** | `TimeSeriesCompactionStrategy` — 창 정렬 + 창 내부 UCS 위임 + retention 창 통삭제 + 닫힌 창 동결(창당 1 SSTable, `WindowFrozenListener` 이벤트 훅, far-future 가드 `max_future_window`, **동결 시점에** 이미 만료된 TTL 데이터는 retention 없이 회수 — 동결 이후 만료되는 데이터는 `retention` 필요) + 지각 격리(flush/스트리밍 창 경계 스플릿 — 백필이 과거 창에 국소 편입, 레거시 걸침 SSTable 자동 분할) + **전용 memtable**(테이블별 옵트인 — 행을 쓰기 시점에 TSCS 창으로 배정해 flush 라우팅·64 MiB 파티션 상한 제거, 원시 배열 컬럼 저장으로 행당 힙 **5.5×↓** 실측, 계층화 테이블의 콜드 창은 flush 시점에 바로 청크로) | [timeseries-compaction.md](doc/timeseries/timeseries-compaction.md) · [timeseries-memtable.md](doc/timeseries/timeseries-memtable.md) · [설계 스펙](docs/superpowers/specs/2026-07-31-timeseries-compaction-design.md) |
-| **컬럼 지향 청크 코덱 (chunk format v4)** *(계층형 저장 1단계)* | 창 1개 = 공유 타임스탬프 축 + 일반 컬럼별 독립 섹션의 무손실 압축, 모든 블록이 독립 디코드·랜덤 접근. `double`은 ALP/ALP-RD(유일한 double 코덱), 정수·시각 계열은 FOR/델타 비트팩, `boolean`은 1비트팩, `text`·불투명 바이트는 사전(DICT)/RAW. 값이 일정한 컬럼은 CONSTANT, 전부 null인 컬럼은 ALL_NULL로 O(1) 처리. 운영 형태 2,000만 건 실측 **~1.7 B/행** (행 저장 11.9 B/행 대비 **7.1×**, 호스트 234) | [포맷 규격](doc/timeseries/chunk-format-v4.md) · [코덱 실측 비교](doc/timeseries/codec-bakeoff.md) · [설계 스펙](docs/superpowers/specs/2026-07-31-industrial-tiered-storage-design.md) |
-| **계층형 저장 (청크 스토어)** *(계층형 저장 2단계)* | 테이블 확장 `timeseries_tiering` 정책 — 백그라운드 재인코더가 hot_window를 지난 창을 청크로 압축해 `<테이블>__chunks`로 이동(지각 데이터 병합, cold_window 만료, CL 쿼럼 하한). `nodetool retier`/`tieringstatus`, `system_views.timeseries_tiering`. **투명 읽기(SP3)**: 베이스 테이블 SELECT가 핫 로우+청크를 자동 병합 — 시간범위·포인트·집계·gap-fill·LIMIT/DESC가 핫·콜드에 걸쳐 동작 | [tiered-storage.md](doc/timeseries/tiered-storage.md) |
-| **테스트 인프라** | 도커 통합 테스트 93건(릴리스 게이트), 3노드 클러스터 테스트 49건, 1억 건 스케일 하네스, jvm-dtest, JMH 성능 회귀 게이트, GC 비교(ZGC vs G1) | [보고서들](doc/timeseries/) |
-| **배포/CI** | Testcontainers 호환 도커 이미지, GitLab CI(빌드→테스트→이미지→통합 게이트→릴리스), 태그 릴리스 자동화 | [.gitlab-ci.yml](.gitlab-ci.yml) |
+| **21 time-series CQL functions** | `time_bucket`, `first`/`last`, `delta`/`rate`/`derivative`, reset-aware `counter_delta`/`counter_rate`, `percentile`, `time_weighted_average`, `integral`, `variance`/`stddev`, `histogram`, `approx_count_distinct`, bivariate `corr`/`covar_*`/`regr_*` | [Usage §2–9](#using-time-series-cql) |
+| **Gap-fill** | `GROUP BY time_bucket_gapfill(width, ts, start, finish)` — materialises empty buckets, with `locf()`/`interpolate()` fill policies | [Usage §3](#3-filling-gaps-time_bucket_gapfill) |
+| **Full-text search** | SAI `LIKE` with `index_analyzer` (ngram/standard/cjk/keyword or JSON) — true substring matching including mid-word fragments, fragments spanning a space, and Korean, with no `ALLOW FILTERING` | [fulltext-search.md](doc/timeseries/fulltext-search.md) |
+| **Time-series compaction (TSCS)** | `TimeSeriesCompactionStrategy` — window ordering, in-window UCS delegation, whole-window retention drops, closed-window freeze (one SSTable per window, `WindowFrozenListener` event hook, far-future guard `max_future_window`, and reclamation of data already expired **at the moment of freeze** without retention — data expiring after the freeze needs `retention`), plus late-data isolation (flush and streaming split at window boundaries so backfill lands locally in its own past window; legacy spanning SSTables are split automatically) and a **dedicated memtable** (opt-in per table — rows are assigned to their TSCS window at write time, removing flush routing and the 64 MiB partition cap; primitive-array column storage measured at **5.5× less heap per row**; cold windows on a tiered table flush straight to chunks) | [timeseries-compaction.md](doc/timeseries/timeseries-compaction.md) · [timeseries-memtable.md](doc/timeseries/timeseries-memtable.md) |
+| **Column-oriented chunk codec (chunk format v4)** *(tiered storage, stage 1)* | One window = a shared timestamp axis plus an independent section per regular column, losslessly compressed, every block independently decodable and randomly addressable. `double` uses ALP/ALP-RD (the only double codec); integers and time types use FOR/delta bit-packing; `boolean` packs to one bit; `text` and opaque bytes use a dictionary (DICT) or RAW. A column whose value never changes becomes CONSTANT and an all-null column becomes ALL_NULL, both O(1). Measured at **~1.7 B/row** on 20M rows of the production shape — **7.1×** against row storage's 11.9 B/row, host 234 | [Format spec](doc/timeseries/chunk-format-v4.md) · [Codec bake-off](doc/timeseries/codec-bakeoff.md) |
+| **Tiered storage (chunk store)** *(tiered storage, stage 2)* | A `timeseries_tiering` table extension policy — a background re-encoder compresses windows past `hot_window` into chunks and moves them to `<table>__chunks` (late-row merge, `cold_window` expiry, a consistency-level quorum floor). `nodetool retier`/`tieringstatus`, `system_views.timeseries_tiering`. **Transparent reads**: a `SELECT` on the base table merges hot rows with chunks automatically — ranges, point lookups, aggregates, gap-fill and `LIMIT`/`DESC` all work across hot and cold | [tiered-storage.md](doc/timeseries/tiered-storage.md) |
+| **Test infrastructure** | 93 docker integration assertions (the release gate), a 49-assertion three-node cluster test, a 100-million-row scale harness, jvm-dtests, a JMH performance regression gate, and a GC comparison (ZGC vs G1) | [Reports](doc/timeseries/) |
+| **Packaging / CI** | Testcontainers-compatible docker image, GitLab CI (build → test → image → integration gate → release), automated tag releases | [.gitlab-ci.yml](.gitlab-ci.yml) |
 
-## 📖 문서
+## 📖 Documentation
 
-| 문서 | 내용 |
+| Document | Contents |
 | --- | --- |
-| **[사용 예제 (examples.md)](doc/timeseries/examples.md)** | 아래 "시계열 CQL 사용법"의 원본 예제 모음 (영문) |
-| [시계열 함수 설계 (timeseries-functions-design.md)](doc/timeseries/timeseries-functions-design.md) | 각 함수의 시그니처·의미론(semantics), 분산 환경에서의 정확성, 코드 위치 |
-| [Gap-Fill 설계 (gapfill-design.md)](doc/timeseries/gapfill-design.md) | `time_bucket_gapfill`의 CQL 문법, 보간 규칙, 가드레일 |
-| [Continuous Aggregates 설계 (continuous-aggregates-design.md)](doc/timeseries/continuous-aggregates-design.md) | 시간 버킷 롤업(연속 집계) 설계안 — 진행 중 |
-| **[풀텍스트 검색 (fulltext-search.md)](doc/timeseries/fulltext-search.md)** | SAI `LIKE` + `index_analyzer` — 로그/메시지 본문 부분문자열 검색 (한글 포함) |
-| **[프로덕션 투입 체크리스트 (production-rollout.md)](doc/timeseries/production-rollout.md)**  | 계층화를 실 운영 테이블에 처음 켜기 전 확인 목록 — 되돌릴 수 없는 지점, 스키마 요건, TTL→`cold_window` 이관, 애플리케이션 영향, 검증 절차 |
-| **[계층화 벤치마크 (tiering-benchmark.md)](doc/timeseries/tiering-benchmark.md)** | 운영 형태 2,000만 건 전/후 실측 (호스트 234, chunk v4) — 저장 **7.1×↓**, 집계 **3~6×↑**, gap-fill **5.4×↑**, 범위 없는 조회 포함 전 질의 동률 이상, 재인코딩 108k rows/s |
-| **[운영 튜닝 가이드 (operations-tuning.md)](doc/timeseries/operations-tuning.md)** | 장기 보존(10년) 전환 실전 가이드 — 용량 산수, 적용 순서, 원본·**청크 테이블** 튜닝값과 근거, TTL과 계층화의 관계, 점검 목록 |
-| **[시계열 컴팩션 (timeseries-compaction.md)](doc/timeseries/timeseries-compaction.md)** | `TimeSeriesCompactionStrategy` — 창 크기·동결·`retention` 설정, 창의 일생, 지각 데이터 격리, 파킹된 창의 두 원인과 진단법, TTL이 아니라 `retention`이 만료를 담당하는 이유, **운영 노드 실측** |
-| **[시계열 전용 Memtable (timeseries-memtable.md)](doc/timeseries/timeseries-memtable.md)** | `TimeSeriesMemtable` — 켜는 법(yaml 설정 키 + `ALTER TABLE`, 두 단계를 틀리기 쉬운 이유), 지원/미지원 스키마와 폴백 동작, 파킹 원인 제거·행당 힙 5.5× 실측·**스트리밍 읽기**(슬라이스 이진 탐색, 필요한 행만 조립, 보유 0)·콜드 창 청크 직접 flush(내구성 순서), 확인 절차 |
-| **[운영 투입 보고서 2026-08-02 (prod-ops-report-2026-08-02.md)](doc/timeseries/prod-ops-report-2026-08-02.md)** | 실 노드 12시간 기록 — 배포 5회, 사고 2건의 전말과 재발 방지, 판단이 뒤집힌 것들, 실측 절차 |
-| **[운영 TSCS 설정과 파킹 진단 (prod-tscs-settings.md)](doc/timeseries/prod-tscs-settings.md)** | 75개 테이블의 현재 설정과 근거, 파킹된 창의 두 원인을 가르는 진단 절차, 24k rows/s 유입 중 실측값 |
-| **[계층형 저장 (tiered-storage.md)](doc/timeseries/tiered-storage.md)** | `timeseries_tiering` 정책·청크 재인코더 — 설정, 청크 조회 패턴, 운영(nodetool/가상 테이블), 불변식과 제한사항 |
-| **[압축 설명 (compression.md)](doc/timeseries/compression.md)** | 컬럼별로 무엇이 왜 얼마나 줄어드는가 — 두 압축 층의 관계, 타입별 인코딩과 행당 비용, 절감폭의 컬럼별 분해(8컬럼 중 4개가 0바이트), 내 테이블 추정 규칙과 실측 방법 |
-| **[청크 포맷 v4 (chunk-format-v4.md)](doc/timeseries/chunk-format-v4.md)** | 유일한 청크 포맷의 **와이어 포맷 규격** — 헤더·디렉토리·블록 테이블·presence 4모드·타입별 블록 인코딩(ALP 포함), 결정성 규칙, 크기 한계 (v1~v3는 제거된 포맷 — 읽으면 `UnsupportedChunkFormatException`) |
-| [코덱 bake-off (codec-bakeoff.md)](doc/timeseries/codec-bakeoff.md) | double 코덱 실측 비교 — **ALP/ALP-RD 단일화** 결론과 분포별 B/값 (Gorilla·Chimp128 대비) |
-| [통합 테스트 보고서](doc/timeseries/integration-test-report.md) | 실제 컨테이너에서 실행한 각 검증의 CQL·결과·소요 시간 |
-| [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md) | 1억 행 용량 검증 — 적재·집계의 스캔 행 수 선형성 (구형 호스트 기록; 현재 수치는 계층화 벤치마크) |
-| **[읽기/쓰기 처리량 벤치마크 (rw-throughput-benchmark.md)](doc/timeseries/rw-throughput-benchmark.md)** | 초당 처리량 실측 — 적재 **233k rows/s**(호스트 234) · 쓰기 경로 424k rows/s·청크 인코딩 684k rows/s·청크 풀스캔 740µs/3,600행(호스트 237, JMH) · 재인코딩 108k rows/s · 패턴별 읽기 ops/s는 v4 재측정 대기 |
-| **[Memtable 쓰기 튜닝 기록 (memtable-write-tuning.md)](doc/timeseries/memtable-write-tuning.md)** | 쓰기 경로 최적화 기록 — DESC가 끄는 두 고속 경로, 설정 튜닝의 한계, 코드 수정 3라운드(min 가드·역순 long 스토어·꼬리 인덱스), ALTER 순서 함정 |
-| [SP4 계획 (sp4-plan.md)](doc/timeseries/sp4-plan.md) | SP4 로드맵 — Compressed Query·vectorized 집계 커널·SIMD 등의 삽입 지점·마일스톤·검증 게이트 (진행 상태는 문서 참고) |
-| [GC 비교: ZGC generational vs G1](doc/timeseries/gc-comparison.md) | 같은 1억 건 데이터로 두 GC의 쿼리 시간·쓰기 처리량 비교 (원자료) |
-| **[아티클: 시계열 DB에서 G1GC vs Generational ZGC](doc/timeseries/g1gc-vs-zgc-article.md)** | 위 측정을 정리한 성능 비교 아티클 (환경·방법·해석·권장 설정) |
+| **[examples.md](doc/timeseries/examples.md)** | The source examples behind "Using time-series CQL" below (English) |
+| [timeseries-functions-design.md](doc/timeseries/timeseries-functions-design.md) | Each function's signature and semantics, correctness under distribution, where the code lives |
+| [gapfill-design.md](doc/timeseries/gapfill-design.md) | `time_bucket_gapfill` CQL syntax, interpolation rules, guardrails |
+| [continuous-aggregates-design.md](doc/timeseries/continuous-aggregates-design.md) | Time-bucket rollups (continuous aggregates) — design in progress |
+| **[fulltext-search.md](doc/timeseries/fulltext-search.md)** | SAI `LIKE` with `index_analyzer` — substring search over log and message bodies, Korean included |
+| **[production-rollout.md](doc/timeseries/production-rollout.md)** | The checklist before enabling tiering on a real table — one-way doors, schema requirements, migrating TTL to `cold_window`, application impact, verification procedure, and what is still unverified |
+| **[tiering-benchmark.md](doc/timeseries/tiering-benchmark.md)** | Before/after on 20M rows of the production shape (host 234, chunk v4) — storage **7.1×↓**, aggregates **3–6×↑**, gap-fill **5.4×↑**, every query equal or better including unbounded ones, re-encode 108k rows/s |
+| **[operations-tuning.md](doc/timeseries/operations-tuning.md)** | Practical guide to moving to long retention (10 years) — capacity arithmetic, order of application, tuning values for the base **and chunk** tables with reasoning, how TTL relates to tiering, a checklist |
+| **[timeseries-compaction.md](doc/timeseries/timeseries-compaction.md)** | `TimeSeriesCompactionStrategy` — window size, freeze and `retention` settings, the life of a window, late-data isolation, the two causes of a parked window and how to tell them apart, why `retention` rather than TTL owns expiry, **measurements from the production node** |
+| **[timeseries-memtable.md](doc/timeseries/timeseries-memtable.md)** | `TimeSeriesMemtable` — how to enable it (a yaml key *and* an `ALTER TABLE`, and why that two-step is easy to get wrong), supported and unsupported schemas with fallback behaviour, removing the causes of parking, 5.5× less heap per row, **streaming reads** (binary search over slices, assembling only the rows needed, zero retention), cold-window direct chunk flush and its durability ordering, how to verify |
+| **[prod-ops-report-2026-08-02.md](doc/timeseries/prod-ops-report-2026-08-02.md)** | Twelve hours on a real node — five deployments, two incidents in full with their fixes, the judgements that reversed, the measured procedures |
+| **[prod-tscs-settings.md](doc/timeseries/prod-tscs-settings.md)** | Current settings across 75 tables and why, the diagnostic that separates the two causes of a parked window, values measured under 24k rows/s ingest |
+| **[tiered-storage.md](doc/timeseries/tiered-storage.md)** | The `timeseries_tiering` policy and chunk re-encoder — configuration, chunk query patterns, operations (nodetool and virtual tables), invariants and limitations |
+| **[compression.md](doc/timeseries/compression.md)** | What shrinks, why and by how much, column by column — how the two compression layers relate, per-type encoding and per-row cost, the saving broken down by column (4 of 8 columns cost zero bytes), how to estimate for your own table and how to measure it |
+| **[chunk-format-v4.md](doc/timeseries/chunk-format-v4.md)** | **Wire format specification** for the one chunk format — header, directory, block table, the four presence modes, per-type block encodings including ALP, determinism rules, size limits. (v1–v3 are removed formats; reading one raises `UnsupportedChunkFormatException`) |
+| [codec-bakeoff.md](doc/timeseries/codec-bakeoff.md) | Measured comparison of double codecs — why it settled on **ALP/ALP-RD alone**, with bytes-per-value by distribution (against Gorilla and Chimp128) |
+| [integration-test-report.md](doc/timeseries/integration-test-report.md) | The CQL, results and timings of every assertion, as run in a real container |
+| [scale-test-report.md](doc/timeseries/scale-test-report.md) | 100-million-row capacity verification — load and aggregate linearity in rows scanned (recorded on an older host; current figures are in the tiering benchmark) |
+| **[rw-throughput-benchmark.md](doc/timeseries/rw-throughput-benchmark.md)** | Measured throughput — ingest **233k rows/s** (host 234), write path 424k rows/s, chunk encoding 684k rows/s, chunk full scan 740 µs / 3,600 rows (host 237, JMH), re-encode 108k rows/s; per-pattern read ops/s awaiting re-measurement on v4 |
+| **[memtable-write-tuning.md](doc/timeseries/memtable-write-tuning.md)** | The write-path optimisation record — the two fast paths `DESC` turns off, the limits of configuration tuning, three rounds of code changes (min guard, reverse-order long store, tail index), the `ALTER` ordering trap |
+| [sp4-plan.md](doc/timeseries/sp4-plan.md) | SP4 roadmap — insertion points, milestones and verification gates for compressed query, vectorised aggregation kernels, SIMD (see the document for current status) |
+| [gc-comparison.md](doc/timeseries/gc-comparison.md) | Generational ZGC vs G1 on the same 100M rows — query time and write throughput (raw data) |
+| **[g1gc-vs-zgc-article.md](doc/timeseries/g1gc-vs-zgc-article.md)** | The measurements above written up as a comparison article (environment, method, interpretation, recommended settings) |
 
-전체 문서 디렉터리: [doc/timeseries/](doc/timeseries/)
+Full directory: [doc/timeseries/](doc/timeseries/)
 
 ---
 
-# 시계열 CQL 사용법
+# Using time-series CQL
 
-별도 설치나 UDF 등록 없이 `cqlsh`에서 바로 쓸 수 있는 네이티브 함수입니다. 아래 예제는 모두 실행 가능한 CQL입니다.
+These are native functions — no separate installation, no UDF registration. Every example below is runnable CQL.
 
-## 함수 레퍼런스
+## Function reference
 
-**인자 순서가 중요합니다.** 대부분의 시계열 집계는 `(값, 타임스탬프)` 순서입니다.
+**Argument order matters.** Most time-series aggregates take `(value, timestamp)`.
 
-| 함수 | 시그니처 | 반환 | 설명 |
+| Function | Signature | Returns | Description |
 | --- | --- | --- | --- |
-| `time_bucket` | `time_bucket(duration, ts [, origin])` | `timestamp` | 버킷 시작 시각 (다운샘플링용 스칼라) |
-| `time_bucket_gapfill` | `time_bucket_gapfill(width, ts, start, finish)` | `timestamp` | 빈 버킷까지 생성하는 `GROUP BY` 셀렉터 |
-| `locf` | `locf(집계)` | 인자와 동일 | 빈 버킷을 직전 값으로 채움 (LOCF) |
-| `interpolate` | `interpolate(집계)` | `double` | 빈 버킷을 앞뒤 값의 선형 보간으로 채움 |
-| `first` / `last` | `first(value, ts)` / `last(value, ts)` | `value`의 타입 | 시각 기준 최초/최종 값 |
-| `delta` | `delta(value, ts)` | `double` | 마지막 − 첫 샘플 |
-| `rate` | `rate(value, ts)` | `double` | `delta` ÷ 경과 초 (양 끝점 기준) |
-| `derivative` | `derivative(value, ts)` | `double` | 최소제곱 회귀 기울기 (초당) |
-| `counter_delta` / `counter_rate` | `counter_delta(value, ts)` / `counter_rate(value, ts)` | `double` | 리셋을 보정한 카운터 증가량 / 초당 증가율 |
-| `percentile` | `percentile(value, q)` — `q`는 `[0,1]` | `double` | 정확한 연속 백분위 (선형 보간) |
-| `time_weighted_average` | `time_weighted_average(value, ts)` | `double` | 시간 가중 평균 |
-| `integral` | `integral(value, ts)` | `double` | 곡선 아래 면적 (value·초) |
-| `variance` / `stddev` | `variance(value)` / `stddev(value)` | `double` | 표본 분산 / 표준편차 |
-| `corr` / `covar_pop` / `covar_samp` | `corr(y, x)` 등 | `double` | 상관계수 / 모공분산 / 표본공분산 |
-| `regr_slope` / `regr_intercept` / `regr_r2` | `regr_slope(y, x)` 등 | `double` | y의 x에 대한 선형 회귀 |
-| `histogram` | `histogram(value, min, max, nbuckets)` | `list<bigint>` | 등간격 히스토그램 (길이 `nbuckets+2`) |
-| `approx_count_distinct` | `approx_count_distinct(value)` | `bigint` | HyperLogLog 근사 고유값 개수 |
+| `time_bucket` | `time_bucket(duration, ts [, origin])` | `timestamp` | Bucket start time (a scalar, for downsampling) |
+| `time_bucket_gapfill` | `time_bucket_gapfill(width, ts, start, finish)` | `timestamp` | A `GROUP BY` selector that also produces empty buckets |
+| `locf` | `locf(aggregate)` | Same as its argument | Fills an empty bucket with the previous value (LOCF) |
+| `interpolate` | `interpolate(aggregate)` | `double` | Fills an empty bucket by linear interpolation between neighbours |
+| `first` / `last` | `first(value, ts)` / `last(value, ts)` | Type of `value` | Earliest / latest value by time |
+| `delta` | `delta(value, ts)` | `double` | Last sample − first sample |
+| `rate` | `rate(value, ts)` | `double` | `delta` ÷ elapsed seconds (endpoint to endpoint) |
+| `derivative` | `derivative(value, ts)` | `double` | Least-squares regression slope, per second |
+| `counter_delta` / `counter_rate` | `counter_delta(value, ts)` / `counter_rate(value, ts)` | `double` | Counter increase / per-second rate, corrected for resets |
+| `percentile` | `percentile(value, q)` — `q` in `[0,1]` | `double` | Exact continuous percentile (linear interpolation) |
+| `time_weighted_average` | `time_weighted_average(value, ts)` | `double` | Time-weighted mean |
+| `integral` | `integral(value, ts)` | `double` | Area under the curve (value·seconds) |
+| `variance` / `stddev` | `variance(value)` / `stddev(value)` | `double` | Sample variance / standard deviation |
+| `corr` / `covar_pop` / `covar_samp` | `corr(y, x)` etc. | `double` | Correlation / population covariance / sample covariance |
+| `regr_slope` / `regr_intercept` / `regr_r2` | `regr_slope(y, x)` etc. | `double` | Linear regression of y on x |
+| `histogram` | `histogram(value, min, max, nbuckets)` | `list<bigint>` | Equal-width histogram (length `nbuckets+2`) |
+| `approx_count_distinct` | `approx_count_distinct(value)` | `bigint` | HyperLogLog approximate distinct count |
 
-## 1. 스키마와 샘플 데이터
+## 1. Schema and sample data
 
-아래 예제는 모두 산업 현장의 실제 태그 테이블 `tm_tag_point` 위에서 돕니다 — 태그당 파티션 하나, 시간으로 클러스터링, **최신 데이터가 앞**(`DESC`). 컴팩션은 이 포크의 시계열 전용 전략 `TimeSeriesCompactionStrategy`(TSCS)를 씁니다 — SSTable을 시간 창으로 정렬하고, 닫힌 창은 창당 1 SSTable로 동결하며, 보존기간이 지난 창은 컴팩션 없이 통째 삭제합니다. 현재 창 내부의 컴팩션 선택은 UCS 컨트롤러에 위임되므로 UCS의 쓰기 최적 특성은 그대로 유지됩니다.
+Every example below runs on `tm_tag_point`, a real industrial tag table — one partition per tag, clustered by time, **newest first** (`DESC`). Compaction uses this fork's time-series strategy, `TimeSeriesCompactionStrategy` (TSCS): SSTables are ordered into time windows, closed windows freeze to one SSTable each, and windows past their retention are dropped whole without compacting. Compaction choices *inside* the current window are delegated to the UCS controller, so UCS's write-optimised behaviour is preserved.
 
 ```sql
 CREATE KEYSPACE IF NOT EXISTS pp
@@ -142,28 +135,28 @@ CREATE KEYSPACE IF NOT EXISTS pp
 USE pp;
 
 CREATE TABLE tm_tag_point (
-    tag_id     text,                              -- 파티션 키: 태그 하나 = 파티션 하나
+    tag_id     text,                              -- partition key: one tag = one partition
     timestamp  timestamp,
     area_id    text static, asset_id text static, line_id text static,
     opc_id     text static, site_id  text static, tag_name text static,
     type       text static,                       -- 'boolean' | 'long' | 'double' | ...
     attribute  frozen<map<text,text>>,
     error_code int,
-    latency    int,                               -- 수집 지연, 항상 존재
+    latency    int,                               -- collection latency, always present
     quality    int,
-    value      text,                              -- 판독값의 문자열 사본
-    value_boolean boolean,                        -- type='boolean'일 때 채워짐
-    value_numeric double,                         -- type이 숫자형일 때 채워짐
+    value      text,                              -- string copy of the reading
+    value_boolean boolean,                        -- populated when type='boolean'
+    value_numeric double,                         -- populated when type is numeric
     PRIMARY KEY (tag_id, timestamp)
 ) WITH CLUSTERING ORDER BY (timestamp DESC)
    AND compaction = {'class': 'TimeSeriesCompactionStrategy',
-                     'window_size': '1d',          -- 시간 창 폭 (계층화 chunk_window와 일치)
-                     'freeze_after': '2h',         -- 창이 닫히고 이 시간 후 창당 1 SSTable로 동결
-                     'scaling_parameters': 'T4',   -- 현재 창 내부는 UCS 위임 (쓰기 최적 4-way)
-                     'retention': '62d'}           -- 창 상한이 62일을 지나면 통째 삭제
-   AND default_time_to_live = 5356800;   -- 62일 (retention과 병행 시 먼저 도래하는 쪽 적용)
+                     'window_size': '1d',          -- window width (match the tiering chunk_window)
+                     'freeze_after': '2h',         -- freeze to one SSTable this long after a window closes
+                     'scaling_parameters': 'T4',   -- inside the current window, delegate to UCS (write-optimised 4-way)
+                     'retention': '62d'}           -- drop a window whole once its upper bound passes 62 days
+   AND default_time_to_live = 5356800;   -- 62 days (with retention, whichever comes first applies)
 
--- static은 태그당 한 번만 씁니다 (샘플마다가 아니라).
+-- Statics are written once per tag, not per sample.
 INSERT INTO tm_tag_point (tag_id, area_id, asset_id, line_id, opc_id, site_id, tag_name, type)
      VALUES ('TAG-001', 'A1', 'AS1', 'L1', 'OPC1', 'S1', 'boiler.temp', 'double');
 
@@ -177,27 +170,27 @@ INSERT INTO tm_tag_point (tag_id, timestamp, attribute, error_code, latency, qua
      VALUES ('TAG-001', '2024-01-01 10:45:00+0000', {}, 0, 902, 192, '22.0', 22.0);
 ```
 
-### 1.0 어느 컬럼을 집계할 수 있나 — 이 스키마 최대의 함정
+### 1.0 Which columns can be aggregated — this schema's biggest trap
 
-**`value`는 `text`라서 수치 집계가 불가능합니다.** `avg(value)`·`percentile(value, 0.95)`·`delta(value, timestamp)`는 전부 거부됩니다(수치 타입만 허용: `tinyint`/`smallint`/`int`/`bigint`/`varint`/`float`/`double`/`decimal`/`counter`). 거부보다 위험한 건 **통과하는 쪽**입니다 — `min(value)`/`max(value)`/`count(value)`는 `text`에도 동작하지만 **사전순**으로 비교하므로, `'9.1'`과 `'20.76'` 중 `max`는 `'9.1'`입니다.
+**`value` is `text`, so numeric aggregation is impossible on it.** `avg(value)`, `percentile(value, 0.95)` and `delta(value, timestamp)` are all rejected (only numeric types are accepted: `tinyint`/`smallint`/`int`/`bigint`/`varint`/`float`/`double`/`decimal`/`counter`). More dangerous than the rejections are the calls that **succeed** — `min(value)`, `max(value)` and `count(value)` work on `text`, but compare **lexicographically**, so between `'9.1'` and `'20.76'` the `max` is `'9.1'`.
 
-산술이 가능한 컬럼은 `latency`(`int`, 항상 존재 — 예제·스모크 테스트의 기본값), `value_numeric`(`double`, 수치형 태그에서만), 그리고 상수인 `error_code`·`quality`입니다. 예외는 `first`/`last`/`approx_count_distinct` — 타입을 가리지 않으므로 `first(value, timestamp)`는 `text`를 그대로 돌려줍니다.
+The columns you can do arithmetic on are `latency` (`int`, always present — the default in examples and smoke tests), `value_numeric` (`double`, numeric tags only), and the constant `error_code` and `quality`. The exceptions are `first`/`last`/`approx_count_distinct`, which are type-agnostic — `first(value, timestamp)` returns the `text` unchanged.
 
-### 1.1 TSCS 컴팩션 옵션 요약
+### 1.1 TSCS compaction options
 
-| 옵션 | 설명 |
+| Option | Description |
 | --- | --- |
-| `window_size` | 시간 창 폭 (`<정수><m\|h\|d>`). 계층형 저장의 `chunk_window`와 맞추길 권장 |
-| `freeze_after` | 창이 닫힌 뒤 이 시간이 지나면 동결 대상 — 지각 데이터 유예 기간 |
-| `scaling_parameters`, `target_sstable_size` | 현재 창 내부 UCS 위임 파라미터 (UCS 문법 그대로: `T4` = 쓰기 최적 4-way tiered 등) |
-| `retention` | 선택 — 창 상한이 `now - retention`을 지나면 SSTable 통째 삭제 (`window_size + freeze_after` 이상) |
-| `max_future_window` | 미래 타임스탬프 가드(기본 `1d`) — 오입력이 창을 오염시키지 않게 격리 |
+| `window_size` | Window width (`<int><m\|h\|d>`). Match the tiering `chunk_window` |
+| `freeze_after` | Freeze once this long has passed since the window closed — the grace period for late data |
+| `scaling_parameters`, `target_sstable_size` | UCS delegation parameters for the current window (UCS syntax verbatim: `T4` = write-optimised 4-way tiered, etc.) |
+| `retention` | Optional — drop the SSTable whole once the window's upper bound passes `now - retention` (must be at least `window_size + freeze_after`) |
+| `max_future_window` | Guard against future timestamps (default `1d`) — keeps bad input from polluting windows |
 
-동결(창당 1 SSTable) 시점에 이미 만료된 TTL 데이터는 `retention` 없이도 회수되고, 파티션+시간범위 조회의 읽기 증폭이 최소화됩니다. 다만 창이 SSTable 1개로 줄면 다시는 동결 후보가 되지 않으므로, **동결 이후에 만료되는 데이터는 `retention`을 설정해야 회수됩니다.** 지각(백필) 데이터는 flush 시 창 경계에서 분리되어 자기 창에 국소 편입됩니다. 상세: [§11 시계열 컴팩션 설정](#11-시계열-컴팩션tscs-설정)
+At the moment of freeze (one SSTable per window), TTL data that has already expired is reclaimed without `retention`, and read amplification for partition+range queries is minimised. But a window that is already down to one SSTable never becomes a freeze candidate again, so **data expiring after the freeze needs `retention` to be reclaimed.** Late (backfill) data is separated at window boundaries on flush and lands locally in its own window. Detail: [§11 TSCS configuration](#11-time-series-compaction-tscs-configuration)
 
-## 2. 버킷팅 · 다운샘플링 — `time_bucket`
+## 2. Bucketing and downsampling — `time_bucket`
 
-### 2.1 각 행에 버킷 붙이기 (스칼라로 사용)
+### 2.1 Tagging each row with its bucket (as a scalar)
 
 ```sql
 SELECT timestamp, time_bucket(1h, timestamp) AS bucket, latency, value
@@ -205,25 +198,25 @@ FROM   tm_tag_point
 WHERE  tag_id = 'TAG-001';
 ```
 
-기간 인자는 **따옴표 없는 CQL duration 리터럴**(`1h`)입니다 — `time_bucket('1h', ts)`처럼 문자열로 주면 시그니처가 맞지 않아 실패합니다. 반면 origin/start/finish는 `timestamp`라서 따옴표를 씁니다.
+The duration argument is an **unquoted CQL duration literal** (`1h`) — passing a string, as in `time_bucket('1h', ts)`, fails to match the signature. The origin/start/finish arguments are `timestamp`s, so those are quoted.
 
-### 2.2 `GROUP BY`로 고정 간격 다운샘플링
+### 2.2 Fixed-interval downsampling with `GROUP BY`
 
 ```sql
--- 시간별 평균 / 최소 / 최대 / 개수 (수집 지연)
+-- Hourly avg / min / max / count (collection latency)
 SELECT time_bucket(1h, timestamp) AS bucket,
        avg(latency), min(latency), max(latency), count(latency)
 FROM   tm_tag_point
 WHERE  tag_id = 'TAG-001'
 GROUP  BY tag_id, time_bucket(1h, timestamp);
 
--- 판독값 자체 (수치형 태그)
+-- The reading itself (numeric tags)
 SELECT time_bucket(1h, timestamp) AS bucket, avg(value_numeric)
 FROM   tm_tag_point
 WHERE  tag_id = 'TAG-001'
 GROUP  BY tag_id, time_bucket(1h, timestamp);
 
--- 다른 간격: 5분, 1일
+-- Other intervals: 5 minutes, 1 day
 SELECT time_bucket(5m, timestamp) AS bucket, avg(latency) FROM tm_tag_point
   WHERE tag_id = 'TAG-001' GROUP BY tag_id, time_bucket(5m, timestamp);
 
@@ -231,23 +224,23 @@ SELECT time_bucket(1d, timestamp) AS bucket, avg(latency) FROM tm_tag_point
   WHERE tag_id = 'TAG-001' GROUP BY tag_id, time_bucket(1d, timestamp);
 ```
 
-`time_bucket`은 `GROUP BY`의 **마지막 요소**(파티션 키 컬럼 뒤)로 와야 그룹핑이 읽기 경로로 내려갑니다. `DESC` 테이블에서도 그대로 동작하며, 버킷이 최신순으로 나올 뿐입니다. `int` 컬럼의 `avg`는 `int`로 절삭된다는 업스트림 규칙이 그대로 적용됩니다.
+`time_bucket` has to be the **last element** of `GROUP BY` (after the partition key columns) for the grouping to be pushed into the read path. It works unchanged on a `DESC` table; the buckets simply come back newest first. Upstream's rule that `avg` of an `int` column truncates to `int` applies here too.
 
-### 2.3 기준점(origin)을 옮긴 버킷
+### 2.3 Buckets with a shifted origin
 
 ```sql
--- 30분 밀린 1시간 버킷: [08:30, 09:30), [09:30, 10:30), ...
+-- Hourly buckets offset by 30 minutes: [08:30, 09:30), [09:30, 10:30), ...
 SELECT time_bucket(1h, timestamp, '2024-01-01 00:30:00+0000') AS bucket, avg(latency)
 FROM   tm_tag_point
 WHERE  tag_id = 'TAG-001'
 GROUP  BY tag_id, time_bucket(1h, timestamp, '2024-01-01 00:30:00+0000');
 ```
 
-## 3. 빈 구간 채우기 — `time_bucket_gapfill`
+## 3. Filling gaps — `time_bucket_gapfill`
 
-일반 `time_bucket`은 **데이터가 있는 버킷만** 반환합니다. `time_bucket_gapfill`은 `[start, finish)` 범위의 **모든** 버킷에 대해 행을 만들어 주므로, 대시보드가 끊김 없는 시간축을 얻습니다. 데이터가 없는 버킷의 집계값은 기본적으로 null입니다.
+Plain `time_bucket` returns **only the buckets that have data**. `time_bucket_gapfill` produces a row for **every** bucket in `[start, finish)`, so a dashboard gets an unbroken time axis. Aggregates in an empty bucket are null by default.
 
-> **⚠️ `DESC` 테이블에서는 `ORDER BY timestamp ASC`가 필수입니다.** gap-fill의 densify는 버킷이 **오름차순**으로 도착한다고 가정하는데, 이를 강제하는 검사가 없습니다. `DESC` 클러스터링 테이블에서 정렬 없이 실행하면 행이 최신순으로 들어와 채움이 거꾸로 적용되며 **에러도 나지 않습니다**. `ORDER BY timestamp ASC`를 붙이면 `DESC` 선언과 `ASC` 요청이 상쇄되어 읽기 자체가 오름차순이 되고, 이것이 densify가 원하는 형태입니다. 이 조합은 아직 테스트로 덮여 있지 않습니다 — [gapfill-design.md §4](doc/timeseries/gapfill-design.md) 참고.
+> **⚠️ On a `DESC` table, `ORDER BY timestamp ASC` is mandatory.** Gap-fill's densify assumes buckets arrive in **ascending** order, and nothing enforces it. Run it without the sort on a `DESC`-clustered table and rows arrive newest-first, the fill is applied backwards, and **no error is raised**. Adding `ORDER BY timestamp ASC` cancels the `DESC` declaration against the `ASC` request so the read itself is ascending, which is what densify wants. This combination is not yet covered by a test — see [gapfill-design.md §4](doc/timeseries/gapfill-design.md).
 
 ```sql
 SELECT time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),
@@ -259,15 +252,15 @@ GROUP  BY tag_id, time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000',
 ORDER  BY timestamp ASC;
 ```
 
-`WHERE timestamp >= <start>`는 장식이 아닙니다 — 스캔되는 행 중 gap-fill `start`보다 **오래된** 것이 하나라도 있으면 *"The floor function starting time is greater than the provided time"*으로 실패합니다.
+`WHERE timestamp >= <start>` is not decoration — if a single scanned row is **older** than the gap-fill `start`, the query fails with *"The floor function starting time is greater than the provided time"*.
 
-### 3.1 `locf()` — 직전 값 이어가기
+### 3.1 `locf()` — carry the previous value forward
 
-집계를 `locf(...)`로 감싸면 빈 버킷이 null 대신 **직전 비어있지 않은 버킷의 값**을 그대로 이어받습니다(last-observation-carried-forward).
+Wrap an aggregate in `locf(...)` and an empty bucket inherits **the value of the previous non-empty bucket** instead of null (last observation carried forward).
 
 ```sql
 SELECT time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),
-       locf(avg(latency))   -- 빈 버킷은 직전 시간의 평균을 반복
+       locf(avg(latency))   -- an empty bucket repeats the previous hour's average
 FROM   tm_tag_point
 WHERE  tag_id = 'TAG-001'
   AND  timestamp >= '2024-01-01 00:00:00+0000' AND timestamp < '2024-01-02 00:00:00+0000'
@@ -275,15 +268,15 @@ GROUP  BY tag_id, time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000',
 ORDER  BY timestamp ASC;
 ```
 
-`locf`는 실제 데이터가 있는 행에는 아무 영향이 없습니다(인자를 그대로 반환). 첫 실제 값보다 앞선 버킷은 이어받을 값이 없으므로 null로 남습니다.
+`locf` has no effect on rows that do have data (it returns its argument unchanged). Buckets before the first real value have nothing to inherit and stay null.
 
-### 3.2 `interpolate()` — 선형 보간
+### 3.2 `interpolate()` — linear interpolation
 
-빈 버킷을 앞뒤 값 사이에서 선형 보간하려면 `interpolate(...)`를 씁니다(결과 타입은 `double`).
+To fill empty buckets by interpolating linearly between neighbours, use `interpolate(...)` (the result type is `double`).
 
 ```sql
 SELECT time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),
-       interpolate(avg(value_numeric))   -- 빈 버킷은 양옆 값 사이를 직선으로 채움
+       interpolate(avg(value_numeric))   -- empty buckets follow a straight line between the values either side
 FROM   tm_tag_point
 WHERE  tag_id = 'TAG-001'
   AND  timestamp >= '2024-01-01 00:00:00+0000' AND timestamp < '2024-01-02 00:00:00+0000'
@@ -291,11 +284,11 @@ GROUP  BY tag_id, time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000',
 ORDER  BY timestamp ASC;
 ```
 
-첫 실제 값 이전 / 마지막 실제 값 이후의 빈 버킷은 보간할 대상이 없으므로 null로 남습니다.
+Empty buckets before the first real value or after the last one have nothing to interpolate between and stay null.
 
-### 3.3 여러 태그
+### 3.3 Multiple tags
 
-태그별로 독립적으로 채워집니다. 파티션 키를 `SELECT`와 `GROUP BY` 양쪽에 포함하세요.
+Each tag is filled independently. Include the partition key in both `SELECT` and `GROUP BY`.
 
 ```sql
 SELECT tag_id, time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000', '2024-01-02 00:00:00+0000'),
@@ -306,29 +299,29 @@ GROUP  BY tag_id, time_bucket_gapfill(1h, timestamp, '2024-01-01 00:00:00+0000',
 ORDER  BY timestamp ASC;
 ```
 
-`IN` + `ORDER BY`는 파티션을 **가로지르는** 후처리 정렬을 걸기 때문에 결과가 태그별이 아니라 버킷 기준 전역 순서로 나옵니다. 이 스키마에서는 태그 하나씩 도는 쪽이 다루기 쉽습니다.
+`IN` plus `ORDER BY` applies a post-sort **across** partitions, so results come back in global bucket order rather than grouped by tag. With this schema, iterating one tag at a time is easier to work with.
 
-### 3.4 제약 사항
+### 3.4 Limitations
 
-- 폭(width)은 **고정 길이**여야 합니다(월 단위 성분 불가).
-- 버킷 컬럼과 `locf(...)`/`interpolate(...)`에 **별칭(alias)을 붙이지 마세요** — 결과 메타데이터의 함수 이름으로 찾기 때문에, 별칭을 붙이면 gap-fill이 조용히 아무 일도 하지 않습니다.
-- 채울 집계는 **수치 컬럼**이어야 합니다 — `latency` 또는 `value_numeric`, `value`(text)는 불가.
-- 버킷 범위를 가로지르는 페이징은 피하세요.
-- 범위 ÷ 폭이 **1,000,000 버킷**을 넘으면 쿼리가 거부됩니다.
+- The width must be a **fixed length** (no month components).
+- **Do not alias** the bucket column or the `locf(...)`/`interpolate(...)` expressions — they are located by function name in the result metadata, so an alias makes gap-fill silently do nothing.
+- The aggregate being filled must be over a **numeric column** — `latency` or `value_numeric`, not `value` (text).
+- Avoid paging across a bucket range.
+- A query is rejected if range ÷ width exceeds **1,000,000 buckets**.
 
-## 4. 최초/최종 값 — `first`, `last`
+## 4. First and last values — `first`, `last`
 
-`first`/`last`는 값 타입을 가리지 않으므로 `text`인 `value`에도 그대로 쓸 수 있습니다 — 이 컬럼으로 서버에서 할 수 있는 몇 안 되는 일 중 하나입니다.
+`first`/`last` are type-agnostic, so they work on `value` even though it is `text` — one of the few things you can do with that column server-side.
 
 ```sql
--- 태그의 최초/최종 판독값 (text 그대로 반환)
+-- A tag's first and last reading (returned as text)
 SELECT first(value, timestamp) AS first_reading,
        last(value, timestamp)  AS last_reading
 FROM   tm_tag_point
 WHERE  tag_id = 'TAG-001';
 ```
 
-시간별 OHLC(시가/고가/저가/종가) 캔들 — 여기서는 **수치 컬럼**을 써야 합니다. `text`에 `max`/`min`을 걸면 사전순 비교가 됩니다:
+Hourly OHLC (open/high/low/close) candles — here you must use a **numeric column**. `max`/`min` on `text` compares lexicographically:
 
 ```sql
 SELECT time_bucket(1h, timestamp) AS bucket,
@@ -341,9 +334,9 @@ WHERE  tag_id = 'TAG-001'
 GROUP  BY tag_id, time_bucket(1h, timestamp);
 ```
 
-`first`/`last`는 **삽입 순서가 아니라 타임스탬프 인자 기준**으로 정렬하므로, 순서가 뒤바뀐 쓰기가 있어도, 그리고 `DESC` 클러스터링이어도 시가/종가가 정확합니다.
+`first`/`last` order by **the timestamp argument, not insertion order**, so open and close are correct even with out-of-order writes and on a `DESC` clustering.
 
-## 5. 변화량 — `delta`, `rate`, `derivative`
+## 5. Change — `delta`, `rate`, `derivative`
 
 ```sql
 SELECT time_bucket(1h, timestamp) AS bucket,
@@ -355,15 +348,15 @@ WHERE  tag_id = 'TAG-001'
 GROUP  BY tag_id, time_bucket(1h, timestamp);
 ```
 
-- `delta` = 버킷 내 마지막 샘플 − 첫 샘플
-- `rate` = `delta` ÷ 경과 초 (양 끝점 기준 변화율)
-- `derivative` = 최소제곱 회귀 기울기. 모든 점을 사용하므로 시계열이 비선형일 때 `rate`와 값이 달라집니다.
+- `delta` = last sample in the bucket − first sample
+- `rate` = `delta` ÷ elapsed seconds (endpoint-to-endpoint rate of change)
+- `derivative` = least-squares regression slope. It uses every point, so it differs from `rate` when the series is non-linear.
 
-두 번째 인자는 `timestamp` 또는 `bigint`(epoch 밀리초)여야 합니다 — `int`·`timeuuid` 시각 컬럼은 거부됩니다. 수치형이 아닌 태그라면 `value_numeric` 대신 `latency`를 넣으세요.
+The second argument must be a `timestamp` or a `bigint` (epoch millis) — `int` and `timeuuid` time columns are rejected. For a non-numeric tag, use `latency` instead of `value_numeric`.
 
-### 5.1 리셋 보정 처리량 — `counter_rate`
+### 5.1 Reset-corrected throughput — `counter_rate`
 
-`counter_delta`/`counter_rate`는 **수치 컬럼**이면 되고 CQL `counter` 타입을 요구하지 않습니다 — 단조 증가하는 `int`/`bigint` 게이지면 충분하며, 테스트가 덮고 있는 것도 이 형태입니다. 리셋 가능성이 있으면 `rate()` 대신 이쪽을 쓰세요. `rate()`는 리셋을 큰 음수 계단으로 오해합니다.
+`counter_delta`/`counter_rate` only need a **numeric column**; they do not require the CQL `counter` type. A monotonically increasing `int`/`bigint` gauge is enough, and that is the shape the tests cover. Use these instead of `rate()` wherever a reset is possible — `rate()` mistakes a reset for a large negative step.
 
 ```sql
 CREATE TABLE tag_counters (
@@ -371,19 +364,19 @@ CREATE TABLE tag_counters (
     PRIMARY KEY (tag_id, timestamp)
 ) WITH CLUSTERING ORDER BY (timestamp DESC);
 
--- 분당 초당 이벤트 수 (리셋 보정)
+-- Events per second, per minute (reset-corrected)
 SELECT time_bucket(1m, timestamp) AS minute, counter_rate(total, timestamp) AS per_sec
 FROM   tag_counters
 WHERE  tag_id = 'TAG-001'
 GROUP  BY tag_id, time_bucket(1m, timestamp);
 ```
 
-`tm_tag_point`에는 단조 증가 컬럼이 없어 별도 테이블을 씁니다. CQL `counter` **타입**을 쓴 테이블은 **계층화가 아예 불가능**하다는 점도 함께 고려하세요 — 재인코더가 행을 삭제 후 재삽입하는데 삭제된 카운터는 다시 쓸 수 없기 때문입니다. `bigint` 게이지가 계층화 호환 선택지입니다.
+`tm_tag_point` has no monotonic column, hence the separate table. Note too that a table using the CQL `counter` **type** **cannot be tiered at all** — the re-encoder deletes and re-inserts rows, and a deleted counter can never be written again. A `bigint` gauge is the tiering-compatible choice.
 
-## 6. 백분위 · SLO — `percentile`
+## 6. Percentiles and SLOs — `percentile`
 
 ```sql
--- 분당 p50 / p95 / p99 지연시간
+-- p50 / p95 / p99 latency per minute
 SELECT time_bucket(1m, ts) AS minute,
        percentile(latency_ms, 0.50) AS p50,
        percentile(latency_ms, 0.95) AS p95,
@@ -392,48 +385,48 @@ FROM   latencies
 WHERE  service = 'checkout'
 GROUP  BY service, time_bucket(1m, ts);
 
--- 전체 구간 중앙값
+-- Median over the whole range
 SELECT percentile(value, 0.5) AS median FROM metrics WHERE series = 'cpu';
 ```
 
-`percentile`은 인접 값 사이를 선형 보간하는 **정확한** 연속 백분위입니다(`q`는 0~1). 그룹의 값을 메모리에 유지하므로, 무제한 스캔보다는 크기가 제한된 다운샘플 버킷에 적합합니다.
+`percentile` is an **exact** continuous percentile, interpolating linearly between adjacent values (`q` is 0–1). It holds the group's values in memory, so it suits bounded downsample buckets rather than unbounded scans.
 
-## 7. 분포 · 산포 · 카디널리티
+## 7. Distribution, spread and cardinality
 
 ```sql
--- 시간 가중 평균: 각 값이 유효했던 시간만큼 가중.
--- 샘플 간격이 불규칙할 때는 avg() 대신 이것을 쓰세요.
+-- Time-weighted average: each value weighted by how long it was in effect.
+-- Use this instead of avg() when sample intervals are irregular.
 SELECT time_bucket(1h, ts) AS bucket, time_weighted_average(value, ts) AS twa
 FROM   metrics WHERE series = 'cpu' GROUP BY series, time_bucket(1h, ts);
 
--- 곡선 아래 면적 (value·초). 예: 전력(W) → 에너지(J)
+-- Area under the curve (value·seconds). E.g. power (W) -> energy (J)
 SELECT time_bucket(1h, ts) AS bucket, integral(value, ts) AS area
 FROM   metrics WHERE series = 'cpu' GROUP BY series, time_bucket(1h, ts);
 
--- 버킷별 산포
+-- Spread per bucket
 SELECT time_bucket(1h, ts) AS bucket, variance(value) AS var, stddev(value) AS sd
 FROM   metrics WHERE series = 'cpu' GROUP BY series, time_bucket(1h, ts);
 
--- [0, 1000) ms를 10개 등간격 버킷으로 나눈 히스토그램.
--- 결과 리스트: [ <0ms, bucket1, .. bucket10, >=1000ms ]
+-- [0, 1000) ms split into 10 equal buckets.
+-- Result list: [ <0ms, bucket1, .. bucket10, >=1000ms ]
 SELECT histogram(latency_ms, 0, 1000, 10) AS dist
 FROM   latencies WHERE service = 'checkout';
 
--- 분당 고유 클라이언트 IP 근사 개수 (HyperLogLog, 메모리 사용량 고정)
+-- Approximate distinct client IPs per minute (HyperLogLog, fixed memory)
 SELECT time_bucket(1m, ts) AS minute, approx_count_distinct(client_ip) AS unique_ips
 FROM   requests WHERE service = 'api' GROUP BY service, time_bucket(1m, ts);
 ```
 
-## 8. 이변량 통계 · 회귀
+## 8. Bivariate statistics and regression
 
-두 컬럼 사이의 관계를 서버에서 바로 계산합니다. 인자 순서는 `(y, x)` — y가 종속변수입니다.
+Compute the relationship between two columns on the server. Argument order is `(y, x)` — y is the dependent variable.
 
 ```sql
--- 온도와 전력 사용량의 상관관계 (시간별)
+-- Correlation between temperature and power draw, hourly
 SELECT time_bucket(1h, ts)          AS bucket,
        corr(power, temperature)     AS r,
        covar_samp(power, temperature) AS cov,
-       regr_slope(power, temperature) AS slope,      -- 1도당 전력 증가량
+       regr_slope(power, temperature) AS slope,      -- power increase per degree
        regr_intercept(power, temperature) AS intercept,
        regr_r2(power, temperature)  AS r_squared
 FROM   sensors
@@ -441,9 +434,9 @@ WHERE  site = 'plant1'
 GROUP  BY site, time_bucket(1h, ts);
 ```
 
-## 9. 대시보드 종합 쿼리
+## 9. A complete dashboard query
 
-버킷팅, OHLC, 변화량, 백분위를 한 번에:
+Bucketing, OHLC, change and percentiles at once:
 
 ```sql
 SELECT time_bucket(1h, ts)     AS bucket,
@@ -463,9 +456,9 @@ WHERE  series = 'cpu'
 GROUP  BY series, time_bucket(1h, ts);
 ```
 
-## 10. 풀텍스트 검색 — SAI `LIKE` + `index_analyzer`
+## 10. Full-text search — SAI `LIKE` with `index_analyzer`
 
-로그·이벤트 메시지 본문을 시계열 조회 패턴 안에서 검색합니다. `ngram` 분석기가 진짜 부분문자열 매치를 제공합니다(단어 중간 조각, 공백 걸침, 한글 전부 지원). 자세한 내용: [fulltext-search.md](doc/timeseries/fulltext-search.md)
+Search log and event message bodies inside the usual time-series query pattern. The `ngram` analyzer provides true substring matching — mid-word fragments, fragments spanning a space, and Korean all work. Detail: [fulltext-search.md](doc/timeseries/fulltext-search.md)
 
 ```sql
 CREATE TABLE logs (
@@ -476,251 +469,249 @@ CREATE TABLE logs (
 CREATE INDEX logs_msg_idx ON logs(msg) USING 'sai'
   WITH OPTIONS = { 'index_analyzer': 'ngram' };
 
--- 장비 1대 · 1시간 구간에서 본문 검색 (ALLOW FILTERING 불필요)
+-- Body search within one device and one hour (no ALLOW FILTERING)
 SELECT ts, msg FROM logs
  WHERE device = 'pump-01'
    AND ts >= '2026-07-31 00:00' AND ts < '2026-07-31 01:00'
-   AND msg LIKE '%타임아웃%';
+   AND msg LIKE '%timeout%';
 
--- 단어 중간 조각도 매치: '%imeou%' 가 "timeout" 을 찾음
--- 접두/접미/완전일치: 'connection%', '%9042', LIKE 'connection refused'
--- 다중 조각 AND: msg LIKE '%connection%' AND msg LIKE '%refused%'
+-- Mid-word fragments match too: '%imeou%' finds "timeout"
+-- Prefix / suffix / exact: 'connection%', '%9042', LIKE 'connection refused'
+-- AND across fragments: msg LIKE '%connection%' AND msg LIKE '%refused%'
 
--- 시계열 함수와 조합: 5분 버킷별 에러 건수
+-- Combined with time-series functions: error count per 5-minute bucket
 SELECT time_bucket(5m, ts), count(*) FROM logs
  WHERE device='pump-01' AND ts >= ? AND ts < ? AND msg LIKE '%timeout%'
  GROUP BY device, time_bucket(5m, ts);
 ```
 
-동작 원리: 값 전체를 2~3글자 n-gram으로 색인(재현율) → 그램 교집합으로 후보 추출 → **원문에 LIKE 패턴 재적용**(정밀도). 색인은 원본 컬럼의 수 배 크기가 되므로 로그성 테이블에 선별 적용하세요. 2글자 미만 조각은 명시적 에러로 거부됩니다. `=`는 완전일치 의미를 유지합니다.
+How it works: the whole value is indexed as 2–3 character n-grams (recall) → candidates come from the gram intersection → **the LIKE pattern is re-applied to the raw value** (precision). The index is several times the size of the source column, so apply it selectively to log-shaped tables. Fragments shorter than two characters are rejected with an explicit error. `=` keeps its exact-match meaning.
 
-## 11. 시계열 컴팩션(TSCS) 설정
+## 11. Time-series compaction (TSCS) configuration
 
-TWCS의 시간 정렬·통삭제와 UCS의 창 내부 컴팩션을 결합한 전용 전략입니다. 테이블 생성(또는 ALTER) 시 지정합니다:
+A dedicated strategy combining TWCS's time ordering and whole-window drops with UCS's in-window compaction. Set it at `CREATE TABLE` or `ALTER`:
 
 ```sql
 ALTER TABLE pp.tm_tag_point WITH compaction = {
   'class': 'TimeSeriesCompactionStrategy',
-  'window_size': '1d',           -- 시간 창 폭 (계층화 chunk_window와 반드시 일치)
-  'freeze_after': '2h',          -- 창이 닫히고 이 시간이 지나면 동결(창당 1 SSTable로 수렴)
-  'scaling_parameters': 'T4',    -- 현재 창 내부는 UCS에 위임 (UCS 문법 그대로)
+  'window_size': '1d',           -- window width (MUST match the tiering chunk_window)
+  'freeze_after': '2h',          -- freeze this long after the window closes (converges to 1 SSTable/window)
+  'scaling_parameters': 'T4',    -- inside the current window, delegate to UCS (UCS syntax verbatim)
   'target_sstable_size': '256MiB',
-  'retention': '62d',            -- 선택: 창 상한이 now-62d를 지나면 컴팩션 없이 통째 삭제
-  'max_future_window': '1d'      -- 선택: 미래 타임스탬프 가드 (기본 1d)
+  'retention': '62d',            -- optional: drop whole, without compacting, once the upper bound passes now-62d
+  'max_future_window': '1d'      -- optional: future-timestamp guard (default 1d)
 };
 ```
 
-- 닫힌 창은 자동으로 **창당 1 SSTable**로 동결되어 읽기 증폭이 최소화되고, 동결 시점에 이미 만료된 TTL 데이터는 retention 없이 회수됩니다. 동결 이후에 만료되는 데이터의 회수는 `retention`이 담당합니다.
-- 지각(백필) 데이터는 flush/스트리밍 시 창 경계에서 분리되어 **자기 창에 국소 편입**됩니다 — 현재 창 컴팩션을 오염시키지 않습니다.
-- 상세: [설계 스펙](docs/superpowers/specs/2026-07-31-timeseries-compaction-design.md)
+- A closed window automatically freezes to **one SSTable**, minimising read amplification, and TTL data already expired at that moment is reclaimed without retention. Reclaiming data that expires *after* the freeze is `retention`'s job.
+- Late (backfill) data is separated at window boundaries during flush and streaming and **lands locally in its own window** — it does not pollute the current window's compaction.
 
-## 12. 계층형 저장(tiered storage) 설정
+## 12. Tiered storage configuration
 
-오래된 창을 컬럼 지향 청크(일반 컬럼 전부를 창의 타임스탬프 축 하나에 담습니다)로 압축해 `<테이블>__chunks`로 옮기고, **SELECT는 그대로**(투명 읽기가 핫+콜드 자동 병합) 쓰는 기능입니다. 테이블 `extensions`에 JSON 정책을 문자열로 넣습니다:
+Compresses old windows into column-oriented chunks (all regular columns onto the window's single timestamp axis), moves them to `<table>__chunks`, and leaves **`SELECT` unchanged** — transparent reads merge hot and cold automatically. The policy goes into the table's `extensions` as a JSON string.
 
-### 12.1 대상 스키마
+### 12.1 Supported schemas
 
-**시간축(`timestamp` 클러스터링 컬럼)이 하나인 시계열 테이블이면 형태를 가리지 않습니다.** 파티션 키는 복합이어도 되고, 일반 컬럼은 개수·타입 무관, static 컬럼은 몇 개든 그대로 보존됩니다 (static 셀은 청크화 대상이 아니고, 재인코더의 클러스터링 레인지 딜리트가 건드리지 않습니다).
+**Any time-series table with a single time axis (one `timestamp` clustering column) works, whatever its shape.** The partition key may be composite, regular columns are unrestricted in count and type, and any number of static columns is preserved as-is (static cells are not chunked, and the re-encoder's clustering range delete does not touch them).
 
-아래는 릴리스 게이트가 실제로 계층화를 검증하는 산업 현장 테이블입니다 — static 7개 + 일반 컬럼 8개, `DESC` 클러스터링:
+Below is the industrial table the release gate actually verifies tiering against — 7 statics and 8 regular columns, `DESC` clustering:
 
 ```sql
 CREATE TABLE pp.tm_tag_point (
-    tag_id     text,                              -- 파티션 키: 개수 무관 (복합 키 가능)
-    timestamp  timestamp,                         -- 클러스터링 1개, timestamp (ASC/DESC 모두 가능)
+    tag_id     text,                              -- partition key: any number of columns (composite allowed)
+    timestamp  timestamp,                         -- exactly one clustering column, timestamp (ASC or DESC)
     area_id    text static, asset_id text static, line_id text static,
     opc_id     text static, site_id  text static, tag_name text static,
-    type       text static,                       -- static: 개수·타입 무관, 계층화 후에도 그대로 보존
-    attribute  frozen<map<text,text>>,            -- 항상 {} → CONSTANT (0바이트)
-    error_code int,                               -- 항상 0 → CONSTANT
-    latency    int,                               -- 고엔트로피 → zigzag varint 델타
-    quality    int,                               -- 항상 192 → CONSTANT
-    value      text,                              -- 판독값의 문자열 사본
-    value_boolean boolean,                        -- type=boolean 태그에서만 채워짐
-    value_numeric double,                         -- type이 숫자형일 때만 채워짐
+    type       text static,                       -- statics: any count and type, preserved after tiering
+    attribute  frozen<map<text,text>>,            -- always {} -> CONSTANT (0 bytes)
+    error_code int,                               -- always 0 -> CONSTANT
+    latency    int,                               -- high entropy -> zigzag varint delta
+    quality    int,                               -- always 192 -> CONSTANT
+    value      text,                              -- string copy of the reading
+    value_boolean boolean,                        -- populated only for type=boolean tags
+    value_numeric double,                         -- populated only when type is numeric
     PRIMARY KEY (tag_id, timestamp)
 ) WITH CLUSTERING ORDER BY (timestamp DESC);
 ```
 
-**`DESC` 클러스터링이 산업 현장의 기본 관용구**입니다(최신부터 읽는 조회가 압도적). 투명 읽기의 경계 산술이 오름차순을 가정하면 콜드 행 0개를 **에러 없이** 돌려주므로, 양쪽 바운드와 양쪽 정렬이 통합 테스트에 고정돼 있습니다.
+**`DESC` clustering is the industrial default idiom** — reading newest-first dominates. If transparent reads' bound arithmetic assumed ascending order it would return zero cold rows **with no error**, so both bound directions and both orderings are pinned in the integration test.
 
-판독값이 `value_boolean`에 들어가는지 `value_numeric`에 들어가는지는 **static `type`이 정합니다.** static이라 태그 단위로 고정되고, 청크 1개 = 태그 1개 × 창 1개이므로 한 청크 안에서 각 값 컬럼은 전부 채워져 있거나 전부 비어 있거나 둘 중 하나입니다 — 쓰이는 쪽은 전용 코덱, 쓰이지 않는 쪽은 ALL_NULL로 0바이트. `value`(text)는 그 판독값의 문자열 사본입니다(`value_numeric = 20.76` ↔ `value = '20.76'`).
+Whether a reading lands in `value_boolean` or `value_numeric` is decided by the **static `type`**. Being static, it is fixed per tag, and one chunk = one tag × one window, so within a chunk each value column is either entirely populated or entirely empty — the used one gets its dedicated codec, the unused one becomes ALL_NULL at zero bytes. `value` (text) is a string copy of the reading (`value_numeric = 20.76` ↔ `value = '20.76'`).
 
-지원되지 않는 형태에 정책을 걸면 60초마다 **사유를 밝힌** ERROR 로그를 남기고 건너뜁니다. 거부 대상은 다섯 가지뿐입니다:
+Apply a policy to an unsupported shape and it is skipped, with an ERROR log **stating the reason** every 60 seconds. There are only five grounds for refusal:
 
-| 형태 | 사유 |
+| Shape | Reason |
 | --- | --- |
-| `counter` 컬럼 | 재인코더는 행을 삭제 후 재삽입하는데, 삭제된 카운터는 영구히 다시 쓸 수 없습니다 |
-| 비frozen 컬렉션 **일반** 컬럼 | 멀티셀 값은 청크로 인코딩할 수 없습니다 — `frozen<...>`으로 감싸면 지원됩니다 |
-| 클러스터링이 0개·2개 이상이거나 `timestamp`가 아님 | 인코딩할 시간축이 없습니다 |
-| **static이 아닌 컬럼**에 걸린 보조 인덱스(SAI 포함) | 인덱스 엔트리는 행 단위라, 재인코딩된 행이 사라지면 인덱스 질의가 콜드 데이터를 조용히 누락합니다 — 일반 컬럼·클러스터링 컬럼·복합 파티션 키 구성 컬럼 모두 해당. **static 컬럼 인덱스만** 무방 |
-| 이 테이블 위의 머티리얼라이즈드 뷰 | 투명 읽기는 베이스 테이블만 복원하므로 뷰가 오래된 이력을 영구히 잃습니다 |
+| A `counter` column | The re-encoder deletes and re-inserts rows, and a deleted counter can never be written again |
+| A non-frozen collection as a **regular** column | Multi-cell values cannot be encoded into a chunk — wrap in `frozen<...>` and it is supported |
+| Zero or two-plus clustering columns, or one that is not a `timestamp` | There is no time axis to encode |
+| A secondary index (SAI included) on a **non-static column** | Index entries are per row, so when a re-encoded row disappears the index query silently misses cold data — this covers regular columns, clustering columns and columns of a composite partition key. **Only indexes on static columns** are fine |
+| A materialized view over this table | Transparent reads restore only the base table, so the view would permanently lose old history |
 
-> `default_time_to_live`가 있고 `hot_window >= TTL`이면 재인코더가 데이터를 보기 전에 TTL이 먼저 지워 **아무것도 압축되지 않습니다**. 거부하지는 않지만 두 값을 밝힌 WARN을 남깁니다.
+> If `default_time_to_live` is set and `hot_window >= TTL`, the TTL erases data before the re-encoder ever sees it and **nothing is ever compressed**. This is not refused, but it logs a WARN naming both values.
 
-> **⚠️ 계층화 켜기 전에 반드시 알아야 할 두 가지 (상세: [tiered-storage.md §1.1, §5.1.2](doc/timeseries/tiered-storage.md))**
-> 1. **콜드 데이터는 불변입니다** — 핫 윈도를 넘어서는 `DELETE`(셀·행·레인지·파티션)와 `SET col = null`은 **거부**됩니다. 청크가 유일한 사본이라 톰스톤은 `gc_grace` 때까지만 가려주고 그 뒤 데이터가 되살아나기 때문입니다. 콜드 데이터 삭제는 `cold_window` 만료를 쓰십시오. 핫 윈도 안의 삭제, 그리고 콜드 구간에 **값을 쓰는** 지각 `UPDATE`는 그대로 동작합니다.
-> 2. **TTL은 청크화되면서 사라집니다** — `default_time_to_live`로 만료시키던 데이터가 청크로 옮겨지면 영구 보존됩니다. TTL에 의존했다면 같은 기간을 `cold_window`에 설정하십시오.
+> **⚠️ Two things to know before enabling tiering** (detail: [tiered-storage.md §1.1, §5.1.2](doc/timeseries/tiered-storage.md))
+> 1. **Cold data is immutable** — a `DELETE` past the hot window (cell, row, range or partition) and `SET col = null` are **rejected**. The chunk is the only copy, so a tombstone would mask it only until `gc_grace`, after which the data would come back. Use `cold_window` expiry to remove cold data. Deletes inside the hot window, and a late `UPDATE` that **writes a value** into the cold range, both work normally.
+> 2. **TTL is dropped when data is chunked** — data you expected `default_time_to_live` to expire is kept forever once it moves into a chunk. If you relied on TTL, set the same period as `cold_window`.
 
-재인코더는 **일반 컬럼 전부**를 청크 1개에 담습니다: 창의 타임스탬프 축을 한 번만 저장하고 컬럼마다 독립 섹션에 **직렬화 바이트 그대로** 넣으므로, `double`/`boolean`/`int`/`bigint`/`timestamp`/`date`/`text`는 전용 코덱을, 나머지(`blob`·`uuid`·`timeuuid`·frozen 컬렉션 등)는 불투명 바이트 폴백을 탑니다. `null` 셀은 `null`로 그대로 왕복하고, 값이 전부 같은 컬럼은 O(1)(0바이트)로 접힙니다. 자세한 표는 [tiered-storage.md §3.1.1](doc/timeseries/tiered-storage.md) 참고.
+The re-encoder puts **every regular column** into one chunk: the window's timestamp axis is stored once, and each column goes into its own section as **its serialized bytes verbatim**, so `double`/`boolean`/`int`/`bigint`/`timestamp`/`date`/`text` take a dedicated codec and everything else (`blob`, `uuid`, `timeuuid`, frozen collections, …) takes the opaque-bytes fallback. `null` cells round-trip as `null`, and a column whose values are all identical folds to O(1), zero bytes. Full table: [tiered-storage.md §3.1.1](doc/timeseries/tiered-storage.md).
 
-### 12.2 압축 켜기 — CQL 한 줄
+### 12.2 Turning it on — one line of CQL
 
-정책 JSON을 테이블 `extensions`에 그대로 넣으면 끝입니다 (hex 변환 불필요):
+Put the policy JSON straight into the table's `extensions`; no hex conversion needed:
 
 ```sql
 ALTER TABLE pp.tm_tag_point WITH extensions = {
   'timeseries_tiering': '{"hot_window":"2d","chunk_window":"1d","cold_window":"3650d","interval":"1h"}'
 };
 
--- 적용 확인 (정책과 실행 통계가 함께 보입니다)
+-- Confirm it applied (the policy and run statistics show together)
 SELECT * FROM system_views.timeseries_tiering;
 ```
 
-> `extensions`는 스키마상 blob 맵이지만, 이 포크는 **평문 문자열을 UTF-8 바이트로 저장**합니다.
-> `0x`로 시작하는 값만 hex 블롭으로 해석하므로 기존 hex 표기(`0x7b22...`)도 그대로 동작합니다.
+> `extensions` is a blob map in the schema, but this fork **stores a plain string as its UTF-8 bytes**. Only a value beginning with `0x` is read as a hex blob, so existing hex notation (`0x7b22...`) still works.
 
-적용 후에는 60초 스위퍼가 `interval` 주기로 알아서 압축합니다. **바로 확인하고 싶으면** 수동으로 한 사이클 실행:
+After that the 60-second sweeper compresses on the `interval` schedule. **To see it immediately**, run one cycle by hand:
 
 ```bash
-nodetool retier pp tm_tag_point   # 1회 재인코딩 (동기 실행, 청크 테이블이 이때 자동 생성됨)
-nodetool tieringstatus            # 테이블별 정책·마지막 실행·누적 통계
+nodetool retier pp tm_tag_point   # one re-encode cycle (synchronous; the chunk table is created here)
+nodetool tieringstatus            # per-table policy, last run, cumulative statistics
 ```
 
 ```sql
--- 압축 결과 확인: 청크가 생기고, SELECT 결과는 그대로 (투명 읽기)
+-- Check the result: chunks exist, and SELECT returns what it did before (transparent reads)
 SELECT count(*) FROM pp.tm_tag_point__chunks WHERE tag_id='TAG-001';
 SELECT count(*) FROM pp.tm_tag_point
  WHERE tag_id='TAG-001' AND timestamp >= '2026-07-01 00:00:00+0000'
-                        AND timestamp <  '2026-07-02 00:00:00+0000';   -- 압축 전과 동일한 값
+                        AND timestamp <  '2026-07-02 00:00:00+0000';   -- same value as before
 
--- static은 청크화 대상이 아니라 계층화 후에도 베이스 테이블에 그대로 남습니다
+-- Statics are not chunked, so they stay on the base table after tiering
 SELECT site_id, tag_name, type FROM pp.tm_tag_point WHERE tag_id='TAG-001' LIMIT 1;
 ```
 
-> 계층화 여부를 세어서 확인할 때는 **반드시 클러스터링 범위를 거세요.** 클러스터링 행이 하나도 남지 않은 파티션에 범위 없이 `count(*)`를 하면 static만 있는 행 때문에 `1`이 나옵니다. 그리고 파티션 키 없는 풀스캔 `SELECT count(*)`는 애초에 병합하지 않으므로(범위 스캔은 핫 로우만 봅니다) 전량 청크화된 테이블에서 **0**을 돌려줍니다.
+> When counting to confirm tiering, **always include a clustering range.** An unrestricted `count(*)` on a partition with no clustering rows left still returns `1`, for the static-only row. And a full-scan `SELECT count(*)` with no partition key does not merge at all (a range scan sees only hot rows), so it returns **0** on a fully-chunked table.
 
-### 12.3 정책 필드
+### 12.3 Policy fields
 
-| 필드 | 의미 |
+| Field | Meaning |
 | --- | --- |
-| `hot_window` | **이 기간 안의 데이터는 건드리지 않습니다**(행 그대로). 실시간 조회·수정이 잦은 구간보다 넉넉히 잡으세요 (예: `7d`) |
-| `chunk_window` | 청크 1개가 담는 시간 폭 (최대 `31d`). TSCS `window_size`와 맞추길 권장. 1초 주기 데이터면 `1h`(=3,600샘플)가 무난 |
-| `cold_window` | 선택 — 이 기간을 지난 청크는 통째 삭제(보존 정책). 미지정(`-1`)이면 영구 보관 |
-| `interval` | 백그라운드 재인코딩 주기 (예: `1h`). 60초 스위퍼가 주기 도래 테이블만 처리 |
-| `consistency` | 재인코더 CL — `LOCAL_QUORUM`(기본) / `QUORUM` / `EACH_QUORUM` / `ALL`만 허용 (약한 CL은 데이터 유실 위험이라 차단) |
+| `hot_window` | **Data within this period is left alone** (kept as rows). Set it comfortably wider than the range that sees frequent live reads and edits (e.g. `7d`) |
+| `chunk_window` | The time width one chunk holds (max `31d`). Match the TSCS `window_size`. For 1-second data, `1h` (3,600 samples) works well |
+| `cold_window` | Optional — chunks past this age are dropped whole (the retention policy). Unset (`-1`) keeps them forever |
+| `interval` | Background re-encode period (e.g. `1h`). The 60-second sweeper processes only tables whose interval has come due |
+| `consistency` | The re-encoder's CL — only `LOCAL_QUORUM` (default), `QUORUM`, `EACH_QUORUM` and `ALL` are accepted (weaker levels risk data loss and are blocked) |
 
-**코덱 선택은 없습니다**: `double`은 ALP/ALP-RD가 유일한 청크 코덱이라 고를 것이 없습니다 (예전 `codec` 옵션은 제거됐고, 남아 있으면 `ALTER TABLE`이 거부합니다). 값이 거의 변하지 않는 상수 계열은 코덱을 타기 전에 컬럼 지향 청크의 CONSTANT 플래그가 O(1)로 처리합니다 — [실측](doc/timeseries/codec-bakeoff.md) 참고.
+**There is no codec to choose**: ALP/ALP-RD is the only chunk codec for `double` (the old `codec` option was removed, and an `ALTER TABLE` that still sets it is rejected). Near-constant columns are handled by the column-oriented chunk's CONSTANT flag in O(1), before any codec runs — see [the measurements](doc/timeseries/codec-bakeoff.md).
 
-### 12.4 끄기·바꾸기
+### 12.4 Changing or turning it off
 
 ```sql
--- 정책 변경: 같은 방식으로 새 JSON을 넣으면 다음 사이클부터 적용
--- 완전히 끄기: 확장에서 키 제거 (이미 만들어진 청크는 그대로 남습니다)
+-- Change the policy: put new JSON in the same way; it applies from the next cycle
+-- Turn it off entirely: remove the key (chunks already written stay)
 ALTER TABLE pp.tm_tag_point WITH extensions = {};
 ```
 
-**정책을 제거해도 이미 청크에 들어간 데이터는 계속 보입니다.** 투명 읽기의 병합 판단은 현재 정책이 아니라 **실제 청크 커버리지**를 기준으로 하므로, 확장 제거는 *새 인코딩을 멈출 뿐*입니다. 같은 이유로 그 구간의 `DELETE`도 계속 거부됩니다(콜드 불변성). `hot_window`를 늘리거나 `chunk_window`를 줄여도 마찬가지로 과거 데이터가 숨겨지지 않습니다. 콜드 데이터를 실제로 없애는 방법은 `cold_window` 만료 또는 청크 테이블 `DROP`뿐입니다.
+**Removing the policy does not hide data already in chunks.** Transparent reads decide whether to merge from **actual chunk coverage**, not from the current policy, so removing the extension only *stops new encoding*. For the same reason, `DELETE` in that range stays rejected (cold immutability). Widening `hot_window` or narrowing `chunk_window` likewise hides nothing. The only ways to actually remove cold data are `cold_window` expiry or `DROP`ping the chunk table.
 
-운영 참고: 지각 데이터는 이미 청크화된 창에 들어와도 다음 사이클에 자동 병합됩니다(같은 타임스탬프면 나중에 들어온 행이 이김). 상세·제한사항(범위 스캔·페이징 등): [tiered-storage.md](doc/timeseries/tiered-storage.md) · 실측: [벤치마크](doc/timeseries/tiering-benchmark.md)
+Operational note: late data arriving into an already-chunked window is merged automatically on the next cycle (at the same timestamp, the later arrival wins). Detail and limitations (range scans, paging): [tiered-storage.md](doc/timeseries/tiered-storage.md) · measurements: [the benchmark](doc/timeseries/tiering-benchmark.md)
 
-## 13. 운영 팁
+## 13. Operational notes
 
-- **항상 파티션을 지정하세요**(`WHERE series = ...`) 그리고 시간 범위도 함께. 시계열 스캔은 `ts`로 정렬된 단일 파티션 안에서 가장 저렴합니다.
-- **파티션 크기를 제한하세요.** 고빈도 시리즈라면 파티션 키에 굵은 시간 버킷을 넣어 무한정 커지는 파티션을 막습니다. 예: `PRIMARY KEY ((series, day), ts)`.
-- **TSCS 컴팩션**(`TimeSeriesCompactionStrategy`)을 쓰세요 — 창 정렬·동결·통삭제가 시계열에 맞게 자동화되고, 현재 창 내부는 UCS(`scaling_parameters: 'T4'`)에 위임됩니다. 보존은 `retention`(창 통삭제) 또는 `default_time_to_live`로 지정하면 됩니다.
-- `time_bucket(interval, ts)`는 `GROUP BY`의 마지막 요소(파티션 키 컬럼들 뒤)여야 그룹핑이 읽기 경로로 푸시다운됩니다.
+- **Always specify a partition** (`WHERE series = ...`) and a time range with it. A time-series scan is cheapest inside a single partition ordered by `ts`.
+- **Bound your partition size.** For a high-frequency series, put a coarse time bucket in the partition key so partitions cannot grow without limit: `PRIMARY KEY ((series, day), ts)`.
+- **Use TSCS compaction** — window ordering, freeze and whole-window drops are automated for time series, and the current window is delegated to UCS (`scaling_parameters: 'T4'`). Express retention with `retention` (whole-window drop) or `default_time_to_live`.
+- `time_bucket(interval, ts)` must be the last element of `GROUP BY` (after the partition key columns) for the grouping to be pushed down into the read path.
 
 ---
 
-## 빌드
+## Building
 
-요구 사항: **Java 21**, Ant 1.10 이상(테스트 실행 시 ant-junit 포함). `modules/accord`는 git 서브모듈이므로 `git submodule update --init`이 필요합니다.
+Requirements: **Java 21**, Ant 1.10 or later (with ant-junit for tests). `modules/accord` is a git submodule, so `git submodule update --init` is needed.
 
 ```bash
 .build/sh/ai-build     # clean + jar + checkstyle -> build/apache-cassandra-6.0.0.jar
 ```
 
-빌드 산출물은 항상 `apache-cassandra-6.0.0.jar`입니다(`base.version`이 6.0.0으로 고정되어 있습니다).
+The build artifact is always `apache-cassandra-6.0.0.jar` (`base.version` is pinned to 6.0.0).
 
-> `ant`이 PATH에 없는 머신에서는 `ai-build`가 **아무것도 빌드하지 않고** `BUILD SUCCESSFUL`을 출력합니다 — 로그 요약기가 빈 입력에 그렇게 찍습니다. 그런 환경에서는 CI 컨테이너로 빌드하십시오: `.build/sh/ai-build-image` 후 `.build/sh/ai-in-container '<명령>'`, 게이트 전체는 `.build/sh/ci-local`. 확인은 로그가 아니라 jar의 타임스탬프로 하십시오.
+> On a machine without `ant` on PATH, `ai-build` reports `BUILD SUCCESSFUL` without building anything — its log summarizer prints that on empty input. Build in the CI container instead: `.build/sh/ai-build-image` then `.build/sh/ai-in-container '<command>'`, or `.build/sh/ci-local` for the whole gate. Verify by the timestamp on the jar, not by the log.
 
-## 검증
+## Verification
 
-`.build/sh/ci-local`이 릴리스 게이트의 스테이지를 같은 순서로 로컬에서 돕니다 — jar+checkstyle → 포크 테스트 클래스 → 도커 이미지 → 통합 테스트.
+`.build/sh/ci-local` walks the release gate's stages locally in the same order: jar and checkstyle → the fork's test classes → the docker image → the integration test.
 
 ```bash
-.build/sh/ci-local                  # 3노드 클러스터 테스트까지 포함하려면 --with-cluster
-.build/sh/ci-local --stage image    # 단일 스테이지: jar | tests | image | integration | cluster
+.build/sh/ci-local                  # add --with-cluster for the three-node test
+.build/sh/ci-local --stage image    # one stage: jar | tests | image | integration | cluster
 ```
 
-## 통합 테스트 (릴리스 게이트)
+### Integration test (the release gate)
 
-유닛 테스트는 함수를 프로세스 안에서 검증하지만, [docker/integration-test.sh](docker/integration-test.sh)는 **실제 이미지를 띄워** 스키마 생성부터 읽기 경로·집계·네이티브 프로토콜까지 통과하는 시계열 CQL 결과를 손으로 계산한 값과 대조합니다(93개 검증, 프로세스 재시작 포함).
+Unit tests exercise the functions in-process; [docker/integration-test.sh](docker/integration-test.sh) **boots a real image** and checks time-series CQL results against hand-computed values all the way through schema creation, the read path, aggregation and the native protocol — 93 assertions, including a process restart.
 
 ```bash
 docker build -t cassandra-timeseries:6.0.0 -f docker/Dockerfile .
-./docker/integration-test.sh cassandra-timeseries:6.0.0     # CONTAINER_RUNTIME=podman 도 지원
+./docker/integration-test.sh cassandra-timeseries:6.0.0     # CONTAINER_RUNTIME=podman also works
 ```
 
-실행하면 항목·CQL·결과가 그대로 출력되고, `build/timeseries-it-report.html`(+ 같은 내용의 `.md`)에 보고서가 생성됩니다. **실행 결과 예시: [통합 테스트 보고서](doc/timeseries/integration-test-report.md)** — 각 검증의 CQL·응답·소요 시간이 그대로 들어 있습니다.
+It prints every assertion with the CQL it ran and the rows it got back, and writes a report to `build/timeseries-it-report.html` (and the same content as `.md`). **Example output: [integration test report](doc/timeseries/integration-test-report.md).**
 
-CI에서는 태그를 밀면 `docker-image → docker-integration-test → docker-image-publish + release` 순서로 자동 실행되며, **이 테스트가 통과해야만** 이미지 배포와 릴리스가 진행됩니다. 기본 브랜치에서는 이미지 빌드 비용 때문에 수동(manual) 실행입니다.
+In CI, pushing a tag runs `docker-image → docker-integration-test → docker-image-publish + release` in order, and **only if this test passes** do the image publish and release proceed. On the default branch it is manual, because a full image build is expensive.
 
-### 클러스터 테스트 (3노드)
+### Cluster test (three nodes)
 
-[docker/cluster-test.sh](docker/cluster-test.sh)는 도커 네트워크 위에 실제 컨테이너 3개를 RF=3으로 띄워 49개를 검증합니다 — 단일 노드가 닿지 못하는 것들입니다: 코디네이터 3개 각각을 통한 집계·gap-fill, 레플리카마다 독립적으로 일어나는 TSCS 동결 수렴, OS 프로세스 간 실제 repair 스트리밍, 레플리카를 정말 정지시킨 상태의 QUORUM.
+[docker/cluster-test.sh](docker/cluster-test.sh) runs three real containers on a docker network at RF=3 — 49 assertions covering what a single node cannot reach: aggregation and gap-fill through every coordinator, TSCS freeze converging on each replica independently, a real repair stream between operating-system processes, and QUORUM behaviour with a replica actually stopped.
 
 ```bash
 ./docker/cluster-test.sh cassandra-timeseries:6.0.0
 ```
 
-CI에서는 수동입니다(2G JVM 3개가 공용 러너에 안 들어갈 수 있음). 컴팩션·스트리밍·repair·계층화를 건드린 릴리스라면 손으로 한 번 돌리십시오.
+It is manual in CI (three 2G JVMs may not fit a shared runner), so run it by hand before any release that touches compaction, streaming, repair or tiering.
 
-### 성능 회귀 게이트
+### Performance regression gate
 
-[.build/sh/ci-perf](.build/sh/ci-perf)가 청크 코덱·커서 JMH 클래스를 돌려 기록된 baseline과 비교하고, 임계값을 넘는 회귀에서 실패합니다.
+[.build/sh/ci-perf](.build/sh/ci-perf) runs the chunk codec and cursor JMH classes and compares them against a recorded baseline, failing on a regression beyond the threshold.
 
 ```bash
-.build/sh/ci-perf                   # doc/timeseries/perf-baseline.json 과 비교
-.build/sh/ci-perf --record          # 기준선을 의도적으로 옮길 때만
+.build/sh/ci-perf                   # compare against doc/timeseries/perf-baseline.json
+.build/sh/ci-perf --record          # deliberately move the line
 ```
 
-3회 스윕의 최소값을 취하며(공용 머신에서 1회 스윕은 측정이 되지 못합니다), baseline을 뜬 호스트가 아니면 판정하지 않고 보고만 합니다.
+It takes the minimum of three sweeps (one sweep is not a measurement on a shared machine) and refuses to fail a build against a baseline recorded on a different host.
 
-### 스케일 테스트 (1억 건)
+### Scale test (100 million rows)
 
-[docker/scale-test.sh](docker/scale-test.sh)는 컨테이너 노드에 대량 데이터를 적재하고 각 시계열 쿼리의 **CQL 실행 시간**을 측정합니다. 적재와 쿼리 모두 컨테이너 안에서 cqlsh 번들 파이썬 드라이버로 수행하므로(→ [docker/scale-workload.py](docker/scale-workload.py)) 측정값에 cqlsh 기동 시간이 섞이지 않습니다.
+[docker/scale-test.sh](docker/scale-test.sh) loads bulk data into a containerised node and measures the **CQL execution time** of each time-series query. Both load and queries run inside the container through cqlsh's bundled Python driver (see [docker/scale-workload.py](docker/scale-workload.py)), so cqlsh startup time does not pollute the measurements.
 
 ```bash
 SCALE_ROWS=100000000 SCALE_SERIES=1000 SCALE_LOADERS=16 SCALE_HEAP=16G \
   ./docker/scale-test.sh cassandra-timeseries:6.0.0
-# 적재된 데이터를 재사용해 쿼리만 다시 재기: SCALE_SKIP_LOAD=1
+# Reuse loaded data and re-measure queries only: SCALE_SKIP_LOAD=1
 ```
 
-GC를 바꿔 비교할 수도 있습니다 — `SCALE_GC=g1`(기본은 `zgc`, `conf/jvm21-server.options`에 이미 generational ZGC가 켜져 있음), `SCALE_PASSES=2`(웜업 후 측정), `SCALE_WBENCH_ROWS=10000000`(쓰기 벤치). 두 실행 결과를 `docker/gc-compare.py <prefix-a> <prefix-b>`에 넣으면 비교표가 나옵니다 → **[GC 비교 결과](doc/timeseries/gc-comparison.md)**.
+You can compare GCs — `SCALE_GC=g1` (default is `zgc`; generational ZGC is already enabled in `conf/jvm21-server.options`), `SCALE_PASSES=2` (measure after a warm-up), `SCALE_WBENCH_ROWS=10000000` (write benchmark). Feed two runs to `docker/gc-compare.py <prefix-a> <prefix-b>` for a comparison table → **[GC comparison](doc/timeseries/gc-comparison.md)**.
 
-결과는 `build/timeseries-scale-report.html`(+ 같은 내용의 `.md`)에 생성됩니다. 용량 검증 기록: **[스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md)** — 1억 행 완주와 스캔 행 수 선형성. 현재 기준 성능 수치는 [계층화 벤치마크](doc/timeseries/tiering-benchmark.md)에 있습니다.
+Results land in `build/timeseries-scale-report.html` (and `.md`). Capacity record: **[scale test report](doc/timeseries/scale-test-report.md)**. Current reference figures are in the [tiering benchmark](doc/timeseries/tiering-benchmark.md).
 
-주의: 수백만 행 이상을 집계하려면 서버 타임아웃을 올려야 합니다. `read/range_request_timeout`뿐 아니라 **`native_transport_timeout`(기본 12초)** 이 요청 전체를 자르므로 이 값도 함께 올려야 하며, 이 키는 기본 `cassandra.yaml`에 없어서 추가해야 합니다. 스크립트가 이 설정을 대신 해 줍니다.
+Note: aggregating millions of rows requires raising server timeouts. Besides `read/range_request_timeout`, **`native_transport_timeout` (default 12 s)** cuts the whole request, so it has to be raised too — and that key is absent from the default `cassandra.yaml`, so it must be added. The script does this for you.
 
-### 초당 처리량 (ops/s) 벤치마크
+### Throughput (ops/s) benchmark
 
-위 스케일 테스트가 분석 쿼리 1건의 실행 시간을 잰다면, **초당 몇 건을 처리하는가**는 별도로 측정합니다: 쓰기는 `scale-workload.py load`의 적재 속도(rows/s)가 곧 측정값이고, 읽기는 [docker/rwbench-read.py](docker/rwbench-read.py)(운영 형태 3패턴 — 태그 최신값 / 단건 / 100행 시간창)와 번들 `cassandra-stress`(서버 한계 확인용)로 잽니다. **실행 결과: [읽기/쓰기 처리량 벤치마크](doc/timeseries/rw-throughput-benchmark.md)** — 적재 233k rows/s(호스트 234, 100행 배치), 쓰기 경로 424k rows/s·청크 인코딩 684k rows/s(호스트 237, JMH); 패턴별 읽기 ops/s는 v4 기준 재측정 대기. 재현 명령 전체가 리포트에 있습니다.
+Where the scale test measures the execution time of one analytical query, throughput is measured separately: for writes, the load rate of `scale-workload.py load` (rows/s) is the measurement; for reads, [docker/rwbench-read.py](docker/rwbench-read.py) (three production-shaped patterns — latest value per tag, single row, 100-row time window) and the bundled `cassandra-stress` (to find the server's ceiling). **Results: [read/write throughput benchmark](doc/timeseries/rw-throughput-benchmark.md)** — ingest 233k rows/s (host 234, 100-row batches), write path 424k rows/s and chunk encoding 684k rows/s (host 237, JMH); per-pattern read ops/s awaiting re-measurement on v4. The report carries the full commands to reproduce.
 
-## CI 및 릴리스
+## CI and releases
 
-- 푸시할 때마다 jar를 빌드하고 시계열 테스트 스위트를 실행합니다(`.gitlab-ci.yml`).
-- 최신 master 빌드의 jar: *CI/CD → Pipelines → build-jar 아티팩트*.
-- 태그 푸시(예: `v6.0.0`) 시 jar 다운로드 링크가 포함된 [Release](../../-/releases)가 발행됩니다.
+- Every push builds the jar and runs the time-series test suite (`.gitlab-ci.yml`).
+- Jar from the latest master build: *CI/CD → Pipelines → the `build-jar` artifact*.
+- Pushing a tag (e.g. `v6.0.0`) publishes a [Release](../../-/releases) with a jar download link.
 
-> **CI가 지금 무엇을 말하고 있는지 먼저 확인하십시오.** 2026-08-07 이후 프로젝트 러너가 전부 offline이라 파이프라인이 잡을 시작조차 못 하고 `stuck_pending_no_matching_runners`로 실패합니다 — 그 기간의 빨간 파이프라인은 코드에 대한 진술이 아닙니다. `glab ci list`, `glab ci get -p <id>`로 사유가 보입니다. 러너가 복구될 때까지 검증은 `.build/sh/ci-local`과 `docker/cluster-test.sh`입니다. [production-rollout.md §6](doc/timeseries/production-rollout.md) 참고.
+> **Check what CI is actually telling you.** The project's runners have been offline since 2026-08-07, so pipelines fail at `stuck_pending_no_matching_runners` without starting a job — a red pipeline in that period is not a statement about the code. `glab ci list` and `glab ci get -p <id>` show the reason. Until runners are restored, `.build/sh/ci-local` and `docker/cluster-test.sh` are the verification. See [production-rollout.md §6](doc/timeseries/production-rollout.md).
 
-## 브랜치 및 업스트림 정책
+## Branches and upstream policy
 
-- `master`(= `6.0.0` 브랜치): 릴리스 라인. apache/cassandra의 최신 업스트림 `cassandra-6.0` 브랜치(리모트 `upstream`)와 **항상 머지된 상태로 유지**해야 합니다.
-- 자주 충돌하는 지점: `CHANGES.txt`, `debian/changelog`, `modules/accord` 서브모듈 포인터, `cql3/statements/SelectStatement.java`(gap-fill 연결부).
+- `master` (= the `6.0.0` branch): the release line. It must be **kept merged** with the latest upstream `cassandra-6.0` branch of apache/cassandra (remote `upstream`).
+- Recurring conflict points: `CHANGES.txt`, `debian/changelog`, the `modules/accord` submodule pointer, `cql3/statements/SelectStatement.java` (the gap-fill wiring).
 
-## 개발
+## Development
 
-빌드/테스트/코드 스타일 규칙은 [CLAUDE.md](CLAUDE.md)와 [AGENTS.md](AGENTS.md)를 참고하세요(전체 테스트 스위트는 몇 시간이 걸리므로 대상 테스트만 실행합니다). 테스트 레이아웃은 [TESTING.md](TESTING.md)에 있습니다. 시계열 테스트 진입점: `org.apache.cassandra.cql3.functions.TimeSeriesFctsTest`, `org.apache.cassandra.db.aggregation.TimeBucketGapFillerTest`.
+Build, test and code-style rules are in [CLAUDE.md](CLAUDE.md) and [AGENTS.md](AGENTS.md) — the full test suite takes hours, so run only the targeted tests. Test layout is in [TESTING.md](TESTING.md). Time-series test entry points: `org.apache.cassandra.cql3.functions.TimeSeriesFctsTest`, `org.apache.cassandra.db.aggregation.TimeBucketGapFillerTest`.

@@ -45,8 +45,9 @@ to undo than an uncommitted one.
 
 `CLAUDE.md` lists the recurring conflict spots; this is how each one is actually resolved.
 
-**`README.asc`** — deleted in this fork so GitHub renders `README.md`. Upstream keeps editing it,
-producing a modify/delete conflict. Delete it again: `git rm README.asc`.
+**`README.asc`** — deleted in this fork so GitHub renders `README.md` (the English README;
+`README.ko.md` is the Korean one, and a change to either belongs in both). Upstream keeps editing
+`README.asc`, producing a modify/delete conflict. Delete it again: `git rm README.asc`.
 
 **`build.xml`** — upstream resets `base.version` to an alpha/beta (e.g. `6.0-alpha3`). The fork's
 versioning rule requires `6.0.0`, because the build must produce `build/apache-cassandra-6.0.0.jar`
