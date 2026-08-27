@@ -287,6 +287,13 @@ docker-image-publish:
 release:
   stage: release
   image: registry.gitlab.com/gitlab-org/release-cli:latest
+  # Overrides the global before_script (apt-get, for the temurin image): release-cli is
+  # alpine-based, so apt-get does not exist and the job dies with exit 127 before its script --
+  # and the script itself needs curl, which the image also lacks. Both surfaced on the first tag
+  # this job ever ran (v6.0.0-r1): the runners were dead for every earlier tag, so the job's
+  # definition had never been executed. Same alpine treatment as docker-integration-test.
+  before_script:
+    - apk add --no-cache curl
   rules:
     - if: $CI_COMMIT_TAG
   # Upload the artifacts to the generic package registry before creating the release.
