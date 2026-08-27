@@ -1,138 +1,143 @@
 {
   "benchmarks": {
     "ChunkBitUnpackBench.unpack[width=11]": {
-      "error": 0.020723448085369432,
-      "score": 0.9550852283496665,
+      "error": 0.045079647146701346,
+      "score": 0.9834716378125508,
       "unit": "us/op"
     },
     "ChunkBitUnpackBench.unpack[width=16]": {
-      "error": 0.00512113241508044,
-      "score": 1.0362052527788441,
+      "error": 0.02005076904365096,
+      "score": 1.083255522174502,
       "unit": "us/op"
     },
     "ChunkBitUnpackBench.unpack[width=1]": {
-      "error": 0.01564866296581713,
-      "score": 0.8111793115459649,
+      "error": 0.005671021965541972,
+      "score": 0.8248253534617463,
       "unit": "us/op"
     },
     "ChunkBitUnpackBench.unpack[width=20]": {
-      "error": 0.024200204722121907,
-      "score": 1.1778026789269642,
+      "error": 0.10761550990928104,
+      "score": 1.2247955879599979,
       "unit": "us/op"
     },
     "ChunkBitUnpackBench.unpack[width=2]": {
-      "error": 0.028197881028949257,
-      "score": 0.8648544170047844,
+      "error": 0.04797665004932608,
+      "score": 0.887929142844512,
       "unit": "us/op"
     },
     "ChunkBitUnpackBench.unpack[width=32]": {
-      "error": 0.05507112871021659,
-      "score": 1.3964889234341302,
+      "error": 0.10712771836463833,
+      "score": 1.4471119246366277,
       "unit": "us/op"
     },
     "ChunkBitUnpackBench.unpack[width=4]": {
-      "error": 0.009635580499100791,
-      "score": 0.9211958737138881,
+      "error": 0.04440115433862015,
+      "score": 0.9127022544108636,
       "unit": "us/op"
     },
     "ChunkBitUnpackBench.unpack[width=55]": {
-      "error": 0.022324512109168155,
-      "score": 1.9536311138119307,
+      "error": 0.06460992827493438,
+      "score": 1.9827783551334819,
       "unit": "us/op"
     },
     "ChunkBitUnpackBench.unpack[width=64]": {
-      "error": 0.022977842012824636,
-      "score": 0.7466820139755473,
+      "error": 0.09998320392310288,
+      "score": 0.7968532188614184,
       "unit": "us/op"
     },
     "ChunkBitUnpackBench.unpack[width=7]": {
-      "error": 0.029778905564105815,
-      "score": 0.8485751185450072,
+      "error": 0.04576057892782591,
+      "score": 0.8621937616188949,
       "unit": "us/op"
     },
     "ChunkBitUnpackBench.unpack[width=8]": {
-      "error": 0.017007088063999094,
-      "score": 1.01117710754731,
+      "error": 0.01642224039962725,
+      "score": 1.0368045989587342,
       "unit": "us/op"
     },
     "ChunkBlockDecodeBench.alpReconstructOnly": {
-      "error": 0.08207688579164388,
-      "score": 4.327879552692462,
+      "error": 0.10258106918467301,
+      "score": 4.3555373282006995,
       "unit": "us/op"
     },
     "ChunkBlockDecodeBench.forReconstructOnly": {
-      "error": 0.00647312918296507,
-      "score": 0.11547719490204951,
+      "error": 0.01250213553152063,
+      "score": 0.11849419803652861,
       "unit": "us/op"
     },
     "ChunkBlockDecodeBench.presenceOnly": {
-      "error": 0.006861322685899992,
-      "score": 0.19231403931856156,
+      "error": 0.004068462085105733,
+      "score": 0.1950364000912407,
       "unit": "us/op"
     },
     "ChunkBlockDecodeBench.unpackOnly": {
-      "error": 0.009195062851656466,
-      "score": 0.8169777288574179,
+      "error": 0.009730158934417938,
+      "score": 0.8322884384077784,
       "unit": "us/op"
     },
     "ChunkBlockDecodeBench.wholeBlockDouble": {
-      "error": 0.0653929135293145,
-      "score": 5.379000698123989,
+      "error": 0.23285511828689878,
+      "score": 5.43156496023615,
       "unit": "us/op"
     },
     "ChunkBlockDecodeBench.wholeBlockTimestamp": {
-      "error": 0.08345399690597143,
-      "score": 2.76717470599259,
+      "error": 0.15938399135443548,
+      "score": 2.983857463154284,
       "unit": "us/op"
     },
     "ChunkPresenceBench.decode[mode=ALL_NULL]": {
-      "error": 0.0003277903900193386,
-      "score": 0.006094987293413532,
+      "error": 0.0002608177257092146,
+      "score": 0.006112917395514351,
       "unit": "us/op"
     },
     "ChunkPresenceBench.decode[mode=ALL_PRESENT]": {
-      "error": 0.00014882127162611374,
-      "score": 0.006027242816965379,
+      "error": 0.00011158142269823724,
+      "score": 0.006068276620667122,
       "unit": "us/op"
     },
     "ChunkPresenceBench.decode[mode=BITMAP]": {
-      "error": 0.0005480238460785352,
-      "score": 0.01753372852630894,
+      "error": 0.00044472770482046237,
+      "score": 0.017280525632069676,
       "unit": "us/op"
     },
     "ChunkPresenceBench.decode[mode=RLE]": {
-      "error": 0.009023236895532326,
-      "score": 0.41420337645282884,
+      "error": 0.017796287344656502,
+      "score": 0.4242687706375515,
       "unit": "us/op"
     },
     "ChunkPresenceBench.rankPerRow": {
-      "error": 0.15698051202035365,
-      "score": 8.680896335973568,
+      "error": 0.24772817607278821,
+      "score": 8.717974470724823,
       "unit": "us/op"
     },
     "ChunkPresenceBench.runningIndex": {
-      "error": 0.038917613729492914,
-      "score": 1.2399919119989815,
+      "error": 0.029986892107157527,
+      "score": 1.2477551308600527,
+      "unit": "us/op"
+    },
+    "ChunkReadBench.assembledScan": {
+      "error": 15.562571689236997,
+      "score": 376.27124157072575,
       "unit": "us/op"
     },
     "ChunkReadBench.fullScan": {
-      "error": 75.32502290587628,
-      "score": 757.9103557156783,
+      "error": 14.170822008344436,
+      "score": 788.9465900370523,
       "unit": "us/op"
     },
     "ChunkReadBench.fullScanBySlot": {
-      "error": 3.6544678431215347,
-      "score": 392.69368855475415,
+      "error": 40.11647119982861,
+      "score": 434.1695900039784,
       "unit": "us/op"
     },
     "ChunkReadBench.projectedScan": {
-      "error": 4.093246663013166,
-      "score": 134.22719156748047,
+      "error": 5.5494662349131465,
+      "score": 137.246293063029,
       "unit": "us/op"
     },
     "ChunkReadBench.toTimestamps": {
-      "error": 7.975891366955769,
-      "score": 40.34873540772581,
+      "error": 9.862196325634962,
+      "score": 41.15447488255915,
       "unit": "us/op"
     }
   },

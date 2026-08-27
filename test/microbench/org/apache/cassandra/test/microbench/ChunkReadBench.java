@@ -40,9 +40,20 @@ import org.openjdk.jmh.annotations.Threads;
 import org.openjdk.jmh.annotations.Warmup;
 import org.openjdk.jmh.infra.Blackhole;
 
+import java.util.Iterator;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.marshal.BooleanType;
+import org.apache.cassandra.db.marshal.DoubleType;
+import org.apache.cassandra.db.marshal.LongType;
+import org.apache.cassandra.db.marshal.TimestampType;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.timeseries.BlockEncodings;
 import org.apache.cassandra.db.timeseries.ChunkV4Codec;
 import org.apache.cassandra.db.timeseries.ChunkV4Directory;
+import org.apache.cassandra.db.timeseries.tiering.ChunkReadSupport;
+import org.apache.cassandra.schema.TableMetadata;
 
 /**
  * Whole-chunk reads through {@code ChunkV4Codec}: the doc/timeseries/simd-decode-design.md §5
@@ -80,10 +91,23 @@ public class ChunkReadBench
 
     private ByteBuffer chunk;
     private String[] allColumns;
+    private TableMetadata metadata;
 
     @Setup
     public void setup()
     {
+        DatabaseDescriptor.clientInitialization();
+        metadata = TableMetadata.builder("bench", "chunkread")
+                                .addPartitionKeyColumn("tag_id", UTF8Type.instance)
+                                .addClusteringColumn("ts", TimestampType.instance)
+                                .addRegularColumn("tag", UTF8Type.instance)
+                                .addRegularColumn("site", UTF8Type.instance)
+                                .addRegularColumn("value", DoubleType.instance)
+                                .addRegularColumn("value2", DoubleType.instance)
+                                .addRegularColumn("status", LongType.instance)
+                                .addRegularColumn("flag", BooleanType.instance)
+                                .addRegularColumn("aux", DoubleType.instance)
+                                .build();
         long[] timestamps = new long[ROWS];
         long base = 1_700_000_000_000L;
         for (int i = 0; i < ROWS; i++)
@@ -155,6 +179,31 @@ public class ChunkReadBench
             rows++;
         }
         return rows;
+    }
+
+    /**
+     * The same projected scan carried all the way to assembled {@code Row}s -- what the transparent
+     * read path actually hands the query machinery, and what an aggregate over chunked data pays per
+     * row before a single aggregate function is called.
+     *
+     * <p>Against {@link #projectedScan}, which stops at the cursor, the difference is the whole
+     * assembly layer: a {@code byte[]} serialized afresh per cell, an {@code ArrayCell} over it, the
+     * row's BTree, and the {@code Row} itself. That is the layer a columnar direct-aggregation path
+     * would bypass, so this pair is what decides whether such a path is worth building.
+     */
+    @Benchmark
+    public long assembledScan(Blackhole bh)
+    {
+        Iterator<Row> rows = ChunkReadSupport.rowsFromChunk(metadata, chunk, 1L,
+                                                            Long.MIN_VALUE, Long.MAX_VALUE,
+                                                            false, VALUE_AND_TIME);
+        long n = 0;
+        while (rows.hasNext())
+        {
+            bh.consume(rows.next());
+            n++;
+        }
+        return n;
     }
 
     /** The axis alone, as {@code time_bucket}/gap-fill planning reads it. */
