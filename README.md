@@ -1,3 +1,5 @@
+[English](README.en.md) · [한국어](README.md)
+
 # cassandra-timeseries
 
 **Apache Cassandra for Industrial Timeseries Workload**
@@ -66,7 +68,7 @@ chunk format v4 — [벤치마크 전문](doc/timeseries/tiering-benchmark.md):
 | **시계열 컴팩션 (TSCS)** | `TimeSeriesCompactionStrategy` — 창 정렬 + 창 내부 UCS 위임 + retention 창 통삭제 + 닫힌 창 동결(창당 1 SSTable, `WindowFrozenListener` 이벤트 훅, far-future 가드 `max_future_window`, **동결 시점에** 이미 만료된 TTL 데이터는 retention 없이 회수 — 동결 이후 만료되는 데이터는 `retention` 필요) + 지각 격리(flush/스트리밍 창 경계 스플릿 — 백필이 과거 창에 국소 편입, 레거시 걸침 SSTable 자동 분할) + **전용 memtable**(테이블별 옵트인 — 행을 쓰기 시점에 TSCS 창으로 배정해 flush 라우팅·64 MiB 파티션 상한 제거, 원시 배열 컬럼 저장으로 행당 힙 **5.5×↓** 실측, 계층화 테이블의 콜드 창은 flush 시점에 바로 청크로) | [timeseries-compaction.md](doc/timeseries/timeseries-compaction.md) · [timeseries-memtable.md](doc/timeseries/timeseries-memtable.md) · [설계 스펙](docs/superpowers/specs/2026-07-31-timeseries-compaction-design.md) |
 | **컬럼 지향 청크 코덱 (chunk format v4)** *(계층형 저장 1단계)* | 창 1개 = 공유 타임스탬프 축 + 일반 컬럼별 독립 섹션의 무손실 압축, 모든 블록이 독립 디코드·랜덤 접근. `double`은 ALP/ALP-RD(유일한 double 코덱), 정수·시각 계열은 FOR/델타 비트팩, `boolean`은 1비트팩, `text`·불투명 바이트는 사전(DICT)/RAW. 값이 일정한 컬럼은 CONSTANT, 전부 null인 컬럼은 ALL_NULL로 O(1) 처리. 운영 형태 2,000만 건 실측 **~1.7 B/행** (행 저장 11.9 B/행 대비 **7.1×**, 호스트 234) | [포맷 규격](doc/timeseries/chunk-format-v4.md) · [코덱 실측 비교](doc/timeseries/codec-bakeoff.md) · [설계 스펙](docs/superpowers/specs/2026-07-31-industrial-tiered-storage-design.md) |
 | **계층형 저장 (청크 스토어)** *(계층형 저장 2단계)* | 테이블 확장 `timeseries_tiering` 정책 — 백그라운드 재인코더가 hot_window를 지난 창을 청크로 압축해 `<테이블>__chunks`로 이동(지각 데이터 병합, cold_window 만료, CL 쿼럼 하한). `nodetool retier`/`tieringstatus`, `system_views.timeseries_tiering`. **투명 읽기(SP3)**: 베이스 테이블 SELECT가 핫 로우+청크를 자동 병합 — 시간범위·포인트·집계·gap-fill·LIMIT/DESC가 핫·콜드에 걸쳐 동작 | [tiered-storage.md](doc/timeseries/tiered-storage.md) |
-| **테스트 인프라** | 도커 통합 테스트 52건(릴리스 게이트), 1억 건 스케일 하네스, 3노드 jvm-dtest, GC 비교(ZGC vs G1) | [보고서들](doc/timeseries/) |
+| **테스트 인프라** | 도커 통합 테스트 93건(릴리스 게이트), 3노드 클러스터 테스트 49건, 1억 건 스케일 하네스, jvm-dtest, JMH 성능 회귀 게이트, GC 비교(ZGC vs G1) | [보고서들](doc/timeseries/) |
 | **배포/CI** | Testcontainers 호환 도커 이미지, GitLab CI(빌드→테스트→이미지→통합 게이트→릴리스), 태그 릴리스 자동화 | [.gitlab-ci.yml](.gitlab-ci.yml) |
 
 ## 📖 문서
@@ -89,7 +91,7 @@ chunk format v4 — [벤치마크 전문](doc/timeseries/tiering-benchmark.md):
 | **[압축 설명 (compression.md)](doc/timeseries/compression.md)** | 컬럼별로 무엇이 왜 얼마나 줄어드는가 — 두 압축 층의 관계, 타입별 인코딩과 행당 비용, 절감폭의 컬럼별 분해(8컬럼 중 4개가 0바이트), 내 테이블 추정 규칙과 실측 방법 |
 | **[청크 포맷 v4 (chunk-format-v4.md)](doc/timeseries/chunk-format-v4.md)** | 유일한 청크 포맷의 **와이어 포맷 규격** — 헤더·디렉토리·블록 테이블·presence 4모드·타입별 블록 인코딩(ALP 포함), 결정성 규칙, 크기 한계 (v1~v3는 제거된 포맷 — 읽으면 `UnsupportedChunkFormatException`) |
 | [코덱 bake-off (codec-bakeoff.md)](doc/timeseries/codec-bakeoff.md) | double 코덱 실측 비교 — **ALP/ALP-RD 단일화** 결론과 분포별 B/값 (Gorilla·Chimp128 대비) |
-| [통합 테스트 보고서](doc/timeseries/integration-test-report.md) | 실제 컨테이너에서 실행한 52개 검증의 CQL·결과·소요 시간 |
+| [통합 테스트 보고서](doc/timeseries/integration-test-report.md) | 실제 컨테이너에서 실행한 각 검증의 CQL·결과·소요 시간 |
 | [스케일 테스트 보고서 (1억 건)](doc/timeseries/scale-test-report.md) | 1억 행 용량 검증 — 적재·집계의 스캔 행 수 선형성 (구형 호스트 기록; 현재 수치는 계층화 벤치마크) |
 | **[읽기/쓰기 처리량 벤치마크 (rw-throughput-benchmark.md)](doc/timeseries/rw-throughput-benchmark.md)** | 초당 처리량 실측 — 적재 **233k rows/s**(호스트 234) · 쓰기 경로 424k rows/s·청크 인코딩 684k rows/s·청크 풀스캔 740µs/3,600행(호스트 237, JMH) · 재인코딩 108k rows/s · 패턴별 읽기 ops/s는 v4 재측정 대기 |
 | **[Memtable 쓰기 튜닝 기록 (memtable-write-tuning.md)](doc/timeseries/memtable-write-tuning.md)** | 쓰기 경로 최적화 기록 — DESC가 끄는 두 고속 경로, 설정 튜닝의 한계, 코드 수정 3라운드(min 가드·역순 long 스토어·꼬리 인덱스), ALTER 순서 함정 |
@@ -641,18 +643,50 @@ ALTER TABLE pp.tm_tag_point WITH extensions = {};
 
 빌드 산출물은 항상 `apache-cassandra-6.0.0.jar`입니다(`base.version`이 6.0.0으로 고정되어 있습니다).
 
+> `ant`이 PATH에 없는 머신에서는 `ai-build`가 **아무것도 빌드하지 않고** `BUILD SUCCESSFUL`을 출력합니다 — 로그 요약기가 빈 입력에 그렇게 찍습니다. 그런 환경에서는 CI 컨테이너로 빌드하십시오: `.build/sh/ai-build-image` 후 `.build/sh/ai-in-container '<명령>'`, 게이트 전체는 `.build/sh/ci-local`. 확인은 로그가 아니라 jar의 타임스탬프로 하십시오.
+
+## 검증
+
+`.build/sh/ci-local`이 릴리스 게이트의 스테이지를 같은 순서로 로컬에서 돕니다 — jar+checkstyle → 포크 테스트 클래스 → 도커 이미지 → 통합 테스트.
+
+```bash
+.build/sh/ci-local                  # 3노드 클러스터 테스트까지 포함하려면 --with-cluster
+.build/sh/ci-local --stage image    # 단일 스테이지: jar | tests | image | integration | cluster
+```
+
 ## 통합 테스트 (릴리스 게이트)
 
-유닛 테스트는 함수를 프로세스 안에서 검증하지만, [docker/integration-test.sh](docker/integration-test.sh)는 **실제 이미지를 띄워** 스키마 생성부터 읽기 경로·집계·네이티브 프로토콜까지 통과하는 시계열 CQL 결과를 손으로 계산한 값과 대조합니다(52개 검증).
+유닛 테스트는 함수를 프로세스 안에서 검증하지만, [docker/integration-test.sh](docker/integration-test.sh)는 **실제 이미지를 띄워** 스키마 생성부터 읽기 경로·집계·네이티브 프로토콜까지 통과하는 시계열 CQL 결과를 손으로 계산한 값과 대조합니다(93개 검증, 프로세스 재시작 포함).
 
 ```bash
 docker build -t cassandra-timeseries:6.0.0 -f docker/Dockerfile .
 ./docker/integration-test.sh cassandra-timeseries:6.0.0     # CONTAINER_RUNTIME=podman 도 지원
 ```
 
-실행하면 항목·CQL·결과가 그대로 출력되고, `build/timeseries-it-report.html`(+ 같은 내용의 `.md`)에 보고서가 생성됩니다. **실행 결과 예시: [통합 테스트 보고서](doc/timeseries/integration-test-report.md)** — 52개 검증의 CQL·응답·소요 시간이 그대로 들어 있습니다.
+실행하면 항목·CQL·결과가 그대로 출력되고, `build/timeseries-it-report.html`(+ 같은 내용의 `.md`)에 보고서가 생성됩니다. **실행 결과 예시: [통합 테스트 보고서](doc/timeseries/integration-test-report.md)** — 각 검증의 CQL·응답·소요 시간이 그대로 들어 있습니다.
 
 CI에서는 태그를 밀면 `docker-image → docker-integration-test → docker-image-publish + release` 순서로 자동 실행되며, **이 테스트가 통과해야만** 이미지 배포와 릴리스가 진행됩니다. 기본 브랜치에서는 이미지 빌드 비용 때문에 수동(manual) 실행입니다.
+
+### 클러스터 테스트 (3노드)
+
+[docker/cluster-test.sh](docker/cluster-test.sh)는 도커 네트워크 위에 실제 컨테이너 3개를 RF=3으로 띄워 49개를 검증합니다 — 단일 노드가 닿지 못하는 것들입니다: 코디네이터 3개 각각을 통한 집계·gap-fill, 레플리카마다 독립적으로 일어나는 TSCS 동결 수렴, OS 프로세스 간 실제 repair 스트리밍, 레플리카를 정말 정지시킨 상태의 QUORUM.
+
+```bash
+./docker/cluster-test.sh cassandra-timeseries:6.0.0
+```
+
+CI에서는 수동입니다(2G JVM 3개가 공용 러너에 안 들어갈 수 있음). 컴팩션·스트리밍·repair·계층화를 건드린 릴리스라면 손으로 한 번 돌리십시오.
+
+### 성능 회귀 게이트
+
+[.build/sh/ci-perf](.build/sh/ci-perf)가 청크 코덱·커서 JMH 클래스를 돌려 기록된 baseline과 비교하고, 임계값을 넘는 회귀에서 실패합니다.
+
+```bash
+.build/sh/ci-perf                   # doc/timeseries/perf-baseline.json 과 비교
+.build/sh/ci-perf --record          # 기준선을 의도적으로 옮길 때만
+```
+
+3회 스윕의 최소값을 취하며(공용 머신에서 1회 스윕은 측정이 되지 못합니다), baseline을 뜬 호스트가 아니면 판정하지 않고 보고만 합니다.
 
 ### 스케일 테스트 (1억 건)
 
@@ -679,6 +713,8 @@ GC를 바꿔 비교할 수도 있습니다 — `SCALE_GC=g1`(기본은 `zgc`, `c
 - 푸시할 때마다 jar를 빌드하고 시계열 테스트 스위트를 실행합니다(`.gitlab-ci.yml`).
 - 최신 master 빌드의 jar: *CI/CD → Pipelines → build-jar 아티팩트*.
 - 태그 푸시(예: `v6.0.0`) 시 jar 다운로드 링크가 포함된 [Release](../../-/releases)가 발행됩니다.
+
+> **CI가 지금 무엇을 말하고 있는지 먼저 확인하십시오.** 2026-08-07 이후 프로젝트 러너가 전부 offline이라 파이프라인이 잡을 시작조차 못 하고 `stuck_pending_no_matching_runners`로 실패합니다 — 그 기간의 빨간 파이프라인은 코드에 대한 진술이 아닙니다. `glab ci list`, `glab ci get -p <id>`로 사유가 보입니다. 러너가 복구될 때까지 검증은 `.build/sh/ci-local`과 `docker/cluster-test.sh`입니다. [production-rollout.md §6](doc/timeseries/production-rollout.md) 참고.
 
 ## 브랜치 및 업스트림 정책
 

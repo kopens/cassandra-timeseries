@@ -28,6 +28,34 @@ Key reminders that bite agents:
 - Always use the `.build/sh/ai-*` wrappers, never bare `ant` — they summarize logs and set the working directory.
 - `modules/accord` is a git submodule (the Accord transaction engine, developed at `apache/cassandra-accord`).
 
+## Verification constraints — read before claiming anything passed
+
+The traps below are specific to this fork and this machine, and every one of them has produced a
+convincing false green. Full procedure in `.claude/skills/docker-integration-test`; operational
+constraints in [doc/timeseries/production-rollout.md](doc/timeseries/production-rollout.md) §6.
+
+- **`ant` is not installed on this host, and `.build/sh/ai-build` reports `BUILD SUCCESSFUL` anyway**
+  — `ant-log-summary.py` prints that on empty input and exits 0. `ai-ci-test` pipes through the same
+  summarizer. Build and test in the container: `.build/sh/ai-build-image`, then
+  `.build/sh/ai-in-container '<cmd>'`, or `.build/sh/ci-local` for the whole gate. Both pass
+  `--network host`, without which `apt-get` cannot resolve `archive.ubuntu.com` here.
+- **GitLab CI has confirmed nothing since 2026-08-07** — every runner is stale, so pipelines fail at
+  `stuck_pending_no_matching_runners` without starting a job. A red pipeline is not a statement about
+  the code, and there has been no green one. `.build/sh/ci-local` is the substitute; say which runs
+  you actually did.
+- **Test runs must be serial.** `ci-test` starts with a `realclean`, so a second concurrent run
+  deletes the first's `build/lib/jars` and the victim fails with hundreds of `package org.slf4j does
+  not exist` errors that look like a broken change.
+- **Wall-clock assertions must be pinned to the worst case, not to "now."** A write-guard bug reached
+  two green integration runs because the assertion only reproduced it in the first minutes of an
+  hour. Anything depending on where `now` sits inside a window needs the boundary chosen explicitly.
+- **One JMH sweep is not a measurement on this host.** Consecutive sweeps of the same commit moved a
+  benchmark 545 / 433 / 393 µs. `.build/sh/ci-perf` takes the minimum of three and refuses to gate
+  against a baseline from a different machine; quote its numbers, not a single run's.
+- **The release gate verifies a docker image; production deploys a jar** into an existing install
+  with its own `conf/`, `jvm*.options` and start scripts. A green integration run says the code works
+  in the image's environment, not on node 41.
+
 ## Architecture: the write and read paths
 
 Cassandra is a leaderless, masterless distributed row store. Every node is a peer; any node can coordinate any request. The two most important flows to understand:
