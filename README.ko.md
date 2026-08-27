@@ -514,6 +514,19 @@ ALTER TABLE pp.tm_tag_point WITH compaction = {
 - 지각(백필) 데이터는 flush/스트리밍 시 창 경계에서 분리되어 **자기 창에 국소 편입**됩니다 — 현재 창 컴팩션을 오염시키지 않습니다.
 - 상세: [설계 스펙](docs/superpowers/specs/2026-07-31-timeseries-compaction-design.md)
 
+### 설정 유의사항
+
+| 규칙 | 어기면 생기는 일 |
+| --- | --- |
+| `retention`은 **`window_size + freeze_after` 이상**이어야 합니다 | `ALTER` 시점에 명시적 에러로 거부됩니다. 아직 쓰이고 동결되는 중인 창이 삭제되지 않도록 하는 하한입니다 |
+| **동결된 창은 다시 동결되지 않습니다** | 창이 SSTable 1개로 줄면 동결 후보에서 빠지므로, 그 **이후에** 만료되는 데이터는 동결로 회수되지 않습니다. TTL이 `freeze_after`보다 길면 `retention`이 필요합니다 — `default_time_to_live`만으로는 디스크에 남습니다 |
+| 실제 보존 기간은 **`retention` + `window_size`** | 삭제 조건이 `windowStart <= now - retention - window_size`라, 창 안의 가장 최근 행은 적어둔 값보다 대략 창 하나만큼 더 살아남습니다. 놀라지 말고 미리 감안하십시오 |
+| `window_size`는 계층화 **`chunk_window`와 같게** | 강제되지 않지만, 어긋나면 청크 하나가 컴팩션 창 두 개에 걸쳐 일부만 청크화된 상태로 창이 동결될 수 있습니다. 같은 값을 쓰십시오 |
+| `timestamp_resolution`은 쓰기 측과 일치해야 합니다 | `USING TIMESTAMP` 값을 벽시계 시각으로 읽는 기준입니다. 쓰기가 정말 밀리초를 쓰는 게 아니라면 기본값 `MICROSECONDS`를 두십시오 — 틀리면 모든 행이 1000배 떨어진 창으로 분류돼, 데이터가 먼 미래로 사라지는 것처럼 보입니다 |
+| `max_future_window`(기본 `1d`)는 필터가 아니라 가드입니다 | 이를 넘는 타임스탬프의 행은 **파킹**됩니다 — 컴팩션·동결·retention·계층화에서 전부 제외되고, 잘못된 시계가 지속되는 동안 flush마다 SSTable이 하나씩 쌓입니다. 테이블 MBean의 `FarFutureTimeSeriesSSTables`가 비어 있어야 정상이며, 아니라면 쓰기 측 시계를 고친 뒤 user-defined 또는 maximal 컴팩션으로 다시 씁니다 |
+
+`window_size` 고르기: 너무 작으면 긴 보존 기간에서 SSTable이 수천 개가 되고, 너무 크면 동결과 retention의 단위가 거칠어집니다(창 하나보다 작게는 못 지웁니다). 창 1일 + 보존 62일이면 테이블당 62개로 무난합니다.
+
 ## 12. 계층형 저장(tiered storage) 설정
 
 오래된 창을 컬럼 지향 청크(일반 컬럼 전부를 창의 타임스탬프 축 하나에 담습니다)로 압축해 `<테이블>__chunks`로 옮기고, **SELECT는 그대로**(투명 읽기가 핫+콜드 자동 병합) 쓰는 기능입니다. 테이블 `extensions`에 JSON 정책을 문자열로 넣습니다:
@@ -611,6 +624,23 @@ SELECT site_id, tag_name, type FROM pp.tm_tag_point WHERE tag_id='TAG-001' LIMIT
 | `consistency` | 재인코더 CL — `LOCAL_QUORUM`(기본) / `QUORUM` / `EACH_QUORUM` / `ALL`만 허용 (약한 CL은 데이터 유실 위험이라 차단) |
 
 **코덱 선택은 없습니다**: `double`은 ALP/ALP-RD가 유일한 청크 코덱이라 고를 것이 없습니다 (예전 `codec` 옵션은 제거됐고, 남아 있으면 `ALTER TABLE`이 거부합니다). 값이 거의 변하지 않는 상수 계열은 코덱을 타기 전에 컬럼 지향 청크의 CONSTANT 플래그가 O(1)로 처리합니다 — [실측](doc/timeseries/codec-bakeoff.md) 참고.
+
+### 설정 유의사항
+
+앞의 세 가지는 `ALTER` 시점에 검사돼 그냥 실패합니다. 나머지는 **합법적인 설정인데 원하지 않는 일이 조용히 벌어지는** 경우입니다.
+
+| 규칙 | 어기면 생기는 일 |
+| --- | --- |
+| `hot_window` **≥** `chunk_window` | 거부. 청크보다 좁은 핫 윈도는 아직 쓰이는 중인 창을 인코딩하겠다는 뜻입니다 |
+| `cold_window` **>** `hot_window` | 거부. 인코딩이 허용되기도 전에 만료돼야 한다는 뜻이 됩니다 |
+| `chunk_window` **≤ 31d** | 거부. 재인코더가 창 하나를 통째로 메모리에 올립니다 |
+| `hot_window`와 `chunk_window` 사이에 **여유를 두십시오** | **가장 생각할 값이 이것입니다.** 콜드 데이터를 지우는 쓰기는 `max(청크 커버리지, now - hot_window)` 아래에서 거부되고, 창은 닫히는 즉시 인코딩 대상이 됩니다. 두 값이 같으면(`1h`/`1h`) 창이 닫히는 순간 바로 인코딩 대상이라 **삭제할 수 있는 기간이 사실상 없습니다.** `DELETE`나 `SET col = null`이 필요한 테이블이면 `hot_window`를 `chunk_window`의 몇 배로 잡으십시오(예: `chunk_window 1h` + `hot_window 6h`). 테스트의 1h/1h는 최대 부하 조건이지 권장값이 아닙니다 |
+| `cold_window`가 청크화된 데이터의 **유일한** 보존 장치 | 창이 청크화되면 셀 TTL이 사라지므로, `default_time_to_live`에 의존하던 테이블은 재인코더가 처음 도는 순간 조용히 "유한 보존"에서 "무한 증가"로 바뀝니다. TTL이 해주던 기간을 그대로 `cold_window`에 설정하십시오 — 베이스 행이 사라진 뒤에는 되돌릴 수 없습니다 |
+| `hot_window`는 `default_time_to_live`보다 **짧아야** 합니다 | 합법이지만, 재인코더가 손대기도 전에 TTL이 행을 지우면 **아무것도 압축되지 않습니다.** 계층화가 켜져 있는데 아무 일도 하지 않는 상태가 됩니다. 두 값을 밝힌 WARN을 남깁니다 |
+| `consistency`는 쿼럼 강도만 허용 | `QUORUM`, `LOCAL_QUORUM`(기본), `EACH_QUORUM`, `ALL`. 더 약한 것은 거부됩니다 — 재인코더가 베이스 행을 삭제하므로, 성공했다고 믿었지만 쿼럼에 닿지 않은 쓰기는 그대로 데이터 유실입니다 |
+| 정책을 지워도 **계층화가 풀리지 않습니다** | 투명 읽기는 현재 정책이 아니라 실제 청크 커버리지로 판단합니다. `extensions`를 비우면 *새 인코딩만* 멈추고, 기존 청크는 계속 읽히며 그 구간의 `DELETE`도 계속 거부됩니다. 콜드 데이터를 실제로 없애는 방법은 `cold_window` 만료 또는 청크 테이블 `DROP`뿐입니다 |
+
+`chunk_window` 고르기: 청크 1개 = 태그 1개 × 창 1개이므로 1초 주기 데이터면 `1h`가 3,600샘플로 적당합니다. 훨씬 작으면 청크마다의 헤더 비용이 지배하고, 훨씬 크면 병합 읽기마다 필요 이상으로 디코드합니다.
 
 ### 12.4 끄기·바꾸기
 

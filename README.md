@@ -506,6 +506,20 @@ ALTER TABLE pp.tm_tag_point WITH compaction = {
 - A closed window automatically freezes to **one SSTable**, minimising read amplification, and TTL data already expired at that moment is reclaimed without retention. Reclaiming data that expires *after* the freeze is `retention`'s job.
 - Late (backfill) data is separated at window boundaries during flush and streaming and **lands locally in its own window** — it does not pollute the current window's compaction.
 
+### What to watch when setting these
+
+| Rule | What happens if you get it wrong |
+| --- | --- |
+| `retention` must be **at least `window_size + freeze_after`** | Rejected at `ALTER` time with an explicit error. The floor exists so a window cannot be dropped while it is still being written to and frozen |
+| **A frozen window never freezes again** | Once a window is down to one SSTable it stops being a freeze candidate, so data that expires *after* that point is never reclaimed by the freeze. If rows expire on a TTL longer than `freeze_after`, you need `retention` — `default_time_to_live` alone will leave them on disk |
+| Real retention is **`retention` + `window_size`** | A window is dropped when `windowStart <= now - retention - window_size`, so the newest row in it survives roughly one extra window beyond the number you wrote. Budget for it rather than being surprised by it |
+| `window_size` should equal the tiering **`chunk_window`** | Not enforced, but a mismatch makes one chunk span two compaction windows, so a window can freeze while part of its data is already chunked. Keep them the same number |
+| `timestamp_resolution` must match your writers | It decides how a `USING TIMESTAMP` value is read as a wall-clock time. Set it to `MICROSECONDS` (the default) unless your writers really use milliseconds — get it wrong and every row is classified into a window 1000× away, which looks like data vanishing into the far future |
+| `max_future_window` (default `1d`) is a guard, not a filter | Rows whose timestamp is beyond it are **parked**: excluded from compaction, freeze, retention and tiering, and they accumulate one SSTable per flush for as long as the bad clock persists. The table's `FarFutureTimeSeriesSSTables` MBean attribute should be empty; if it is not, fix the writer, then rewrite them with a user-defined or maximal compaction |
+
+Choosing `window_size`: too small and a long retention means thousands of SSTables; too large and freeze and retention both become coarse (you cannot drop less than one window). One day per window with 62 days of retention is 62 SSTables per table, which is comfortable.
+
+
 ## 12. Tiered storage configuration
 
 Compresses old windows into column-oriented chunks (all regular columns onto the window's single timestamp axis), moves them to `<table>__chunks`, and leaves **`SELECT` unchanged** — transparent reads merge hot and cold automatically. The policy goes into the table's `extensions` as a JSON string.
@@ -602,6 +616,24 @@ SELECT site_id, tag_name, type FROM pp.tm_tag_point WHERE tag_id='TAG-001' LIMIT
 | `consistency` | The re-encoder's CL — only `LOCAL_QUORUM` (default), `QUORUM`, `EACH_QUORUM` and `ALL` are accepted (weaker levels risk data loss and are blocked) |
 
 **There is no codec to choose**: ALP/ALP-RD is the only chunk codec for `double` (the old `codec` option was removed, and an `ALTER TABLE` that still sets it is rejected). Near-constant columns are handled by the column-oriented chunk's CONSTANT flag in O(1), before any codec runs — see [the measurements](doc/timeseries/codec-bakeoff.md).
+
+### What to watch when setting these
+
+Three of these are checked at `ALTER` time and simply fail. The rest are legal settings that quietly do something you did not want.
+
+| Rule | What happens if you get it wrong |
+| --- | --- |
+| `hot_window` **≥** `chunk_window` | Rejected. A hot window narrower than a chunk would mean encoding a window that is still being written |
+| `cold_window` **>** `hot_window` | Rejected. Data would have to expire before it was allowed to be encoded |
+| `chunk_window` **≤ 31d** | Rejected. The re-encoder reads one window into memory at a time |
+| Leave real slack between `hot_window` and `chunk_window` | **This is the setting most worth thinking about.** Writes that would tombstone cold data are refused below `max(chunk coverage, now - hot_window)`, and a window becomes encodable as soon as it closes. With the two equal — `1h`/`1h` — a row is eligible for encoding almost the moment its window closes, so there is effectively no period in which it can still be deleted. If the table ever needs `DELETE` or `SET col = null`, make `hot_window` several times `chunk_window` (e.g. `chunk_window 1h` with `hot_window 6h`). The 1h/1h in the tests is a maximum-load case, not a recommendation |
+| `cold_window` is the **only** retention for chunked data | Cell TTLs are dropped when a window is chunked, so a table relying on `default_time_to_live` silently switches from bounded retention to unbounded growth the first time the re-encoder runs. Set `cold_window` to the same period you expected the TTL to enforce — and note this cannot be undone once the base rows are gone |
+| `hot_window` must be **shorter** than any `default_time_to_live` | Legal, but if the TTL erases rows before the re-encoder is allowed to touch them, nothing is ever compressed. Tiering appears to be on and does nothing. It logs a WARN naming both values |
+| `consistency` accepts only quorum strength | `QUORUM`, `LOCAL_QUORUM` (default), `EACH_QUORUM`, `ALL`. Anything weaker is rejected: the re-encoder deletes the base rows, so a write it believed succeeded but that did not reach a quorum would lose data outright |
+| Removing the policy does **not** un-tier | Transparent reads decide from actual chunk coverage, not from the current policy. Clearing `extensions` only stops new encoding — existing chunks stay readable and `DELETE` in that range stays refused. The only ways to remove cold data are `cold_window` expiry or dropping the chunk table |
+
+Choosing `chunk_window`: one chunk holds one tag × one window, so at 1-second data `1h` is 3,600 samples — a good size. Much smaller and per-chunk header overhead dominates; much larger and each merged read decodes more than it needs.
+
 
 ### 12.4 Changing or turning it off
 
