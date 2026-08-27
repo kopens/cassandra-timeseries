@@ -84,7 +84,15 @@ if wanted image; then
   step "docker-image  ($IMAGE)"
   # --network host: Docker's default bridge has no DNS resolution on the build hosts here, so
   # apt-get inside the builder stage cannot resolve archive.ubuntu.com.
-  docker build --network host -t "$IMAGE" -f docker/Dockerfile .
+  #
+  # DOCKER_BUILDKIT=0: BuildKit injects a SNAPSHOT of resolv.conf taken when the daemon started
+  # into every RUN step. On this host Tailscale periodically rewrites resolv.conf to
+  # 100.100.100.100; once that is fixed back to the LAN resolver, the host resolves fine while
+  # every BuildKit RUN still fails with UnknownHostException on repo1.maven.org -- reproducibly,
+  # in 1.5s, looking exactly like a broken build. The classic builder reads the CURRENT host
+  # resolv.conf. CI parity is unaffected (CI builds this Dockerfile with kaniko, not BuildKit).
+  # Undo when the docker daemon has been restarted after a resolv.conf fix, if ever.
+  DOCKER_BUILDKIT=0 docker build --network host -t "$IMAGE" -f docker/Dockerfile .
 fi
 
 if wanted integration; then

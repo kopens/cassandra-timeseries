@@ -16,7 +16,8 @@ if docker image inspect "$IMAGE" > /dev/null 2>&1; then
   exit 0
 fi
 
-docker build --network host -t "$IMAGE" - <<'DOCKERFILE'
+# DOCKER_BUILDKIT=0: BuildKit RUN steps get a stale snapshot of resolv.conf (see ci-local).
+DOCKER_BUILDKIT=0 docker build --network host -t "$IMAGE" - <<'DOCKERFILE'
 FROM eclipse-temurin:21-jdk
 RUN apt-get update -qq \
  && apt-get install -y -qq --no-install-recommends ant ant-optional python3 git \
