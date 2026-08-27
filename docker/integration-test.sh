@@ -757,6 +757,132 @@ assert "a converged window is not rewritten again (no freeze/split livelock)" \
 check "every row survives the freeze" \
     "SELECT count(*) FROM it.tscs;" "^ *$((TSCS_WINDOWS * TSCS_FLUSHES))$"
 
+section "TSCS retention: an expired window is dropped whole, and only that window"
+# The freeze/split assertions above never delete anything. `retention` does -- it drops a whole
+# SSTable once its window ages out, without compacting -- and until now nothing exercised that
+# through a real node. A retention bug destroys data, so the interesting assertion is not "rows
+# disappeared" but "the RIGHT rows disappeared": old windows go, the current one stays.
+#
+# isExpiredWindow is `windowStart <= now - retention - window_size`, and the option validator
+# requires retention >= window_size + freeze_after. With 1m/1m/2m, a window expires once its start
+# is more than 3 minutes old -- so the 20-minute-old windows below are expired on arrival and the
+# current one cannot be, whenever this runs.
+RET_W0=$(( (NOW2_MS / 60000 - 20) * 60000 ))     # three old windows, 20 minutes back
+RET_NOW_W=$(( (NOW2_MS / 60000) * 60000 ))       # the current window
+cql "
+CREATE TABLE IF NOT EXISTS it.tscs_retention (
+    tag text, ts timestamp, value double,
+    PRIMARY KEY (tag, ts)
+) WITH compaction = {'class':'TimeSeriesCompactionStrategy',
+                     'timestamp_resolution':'MICROSECONDS',
+                     'window_size':'1m','freeze_after':'1m','retention':'2m'};
+" > /dev/null
+sleep 3
+
+STMTS=""
+for w in 0 1 2; do
+    TS_MS=$(( RET_W0 + w * 60000 + 1000 ))
+    STMTS="$STMTS INSERT INTO it.tscs_retention (tag, ts, value) VALUES ('old', $TS_MS, $w) USING TIMESTAMP $(( TS_MS * 1000 ));"
+done
+KEEP_MS=$(( RET_NOW_W + 1000 ))
+STMTS="$STMTS INSERT INTO it.tscs_retention (tag, ts, value) VALUES ('keep', $KEEP_MS, 99) USING TIMESTAMP $(( KEEP_MS * 1000 ));"
+cql "$STMTS" > /dev/null
+ntool flush it tscs_retention > /dev/null
+
+# Background work, so it is waited for rather than asserted immediately -- but bounded, because a
+# retention that never fires is exactly the silent failure this covers.
+printf '   waiting for the retention drop'
+RET_REMAINING=""
+for _ in $(seq 1 24); do
+    RET_REMAINING=$(cql "SELECT count(*) FROM it.tscs_retention WHERE tag='old';" | grep -E '^ *[0-9]+$' | tr -dc '0-9')
+    [ "${RET_REMAINING:-9}" = "0" ] && break
+    printf '.'; sleep 5
+done
+echo
+assert "the three expired windows are dropped" "${RET_REMAINING:-<none>}" "0"
+check "the current window is untouched by retention" \
+    "SELECT value FROM it.tscs_retention WHERE tag='keep';" '^ *99'
+
+section "tiered storage: cold_window is the only retention for chunked data, and it works"
+# Cell TTLs are dropped when a window is chunked, so cold_window is the ONLY thing that ever removes
+# cold data -- and it had no end-to-end coverage at all. As with retention above, the assertion that
+# matters is selectivity: the chunk past cold_window goes, the one inside it stays.
+#
+# The base rows for both windows were already deleted by the re-encoder, so "0 rows" for the expired
+# window means the data is genuinely gone rather than merely hidden.
+cql "
+CREATE TABLE IF NOT EXISTS it.cold_expiry (
+    tag_id text, timestamp timestamp, value double,
+    PRIMARY KEY (tag_id, timestamp)
+);
+" > /dev/null
+OLD_WIN_MS=$(( (NOW2_MS / 3600000 - 5) * 3600000 ))     # expires under cold_window 3h
+NEW_WIN_MS=$(( (NOW2_MS / 3600000 - 2) * 3600000 ))     # cold (past hot_window 1h) but inside 3h
+cql "ALTER TABLE it.cold_expiry WITH extensions = {'timeseries_tiering': '$TIERING_JSON'};" > /dev/null
+cql "
+INSERT INTO it.cold_expiry (tag_id, timestamp, value) VALUES ('t', $(( OLD_WIN_MS + 60000 )), 1);
+INSERT INTO it.cold_expiry (tag_id, timestamp, value) VALUES ('t', $(( OLD_WIN_MS + 120000 )), 2);
+INSERT INTO it.cold_expiry (tag_id, timestamp, value) VALUES ('t', $(( NEW_WIN_MS + 60000 )), 3);
+INSERT INTO it.cold_expiry (tag_id, timestamp, value) VALUES ('t', $(( NEW_WIN_MS + 120000 )), 4);
+" > /dev/null
+check_nodetool "both windows are encoded" '' retier it cold_expiry
+check "two chunks exist, one per window" \
+    "SELECT count(*) FROM it.cold_expiry__chunks WHERE tag_id='t';" '^ *2$'
+
+# Now declare a 3h cold window. The 5h-old chunk is past it; the 2h-old one is not.
+cql "ALTER TABLE it.cold_expiry WITH extensions =
+       {'timeseries_tiering': '{\"hot_window\":\"1h\",\"chunk_window\":\"1h\",\"cold_window\":\"3h\",\"interval\":\"5m\"}'};" > /dev/null
+sleep 3
+check_nodetool "a cycle under the new cold_window expires the old chunk" '' retier it cold_expiry
+check "only the chunk inside cold_window is left" \
+    "SELECT count(*) FROM it.cold_expiry__chunks WHERE tag_id='t';" '^ *1$'
+check "the expired window returns nothing -- the data is gone, not hidden" \
+    "SELECT count(*) FROM it.cold_expiry
+      WHERE tag_id='t' AND timestamp >= $OLD_WIN_MS AND timestamp < $(( OLD_WIN_MS + 3600000 ));" \
+    '^ *0$'
+check "the window inside cold_window still reads back through the merge" \
+    "SELECT count(*) FROM it.cold_expiry
+      WHERE tag_id='t' AND timestamp >= $NEW_WIN_MS AND timestamp < $(( NEW_WIN_MS + 3600000 ));" \
+    '^ *2$'
+check "system_views.timeseries_tiering counts the expiry" \
+    "SELECT keyspace_name, table_name, chunks_expired FROM system_views.timeseries_tiering;" \
+    'cold_expiry'
+
+section "tiered storage: the background sweeper encodes without nodetool"
+# Every tiering assertion above drives the re-encoder through `nodetool retier`. Production does not
+# -- the 60s sweeper does, on the policy's interval. That is a different entry point, and it is the
+# one the coverage-ledger bug surfaced through: the manual path looked fine while a sweep in the
+# background moved the write guard's boundary. Nothing covered it.
+#
+# dueForSweep treats a table it has never attempted as due, so a freshly-configured table is picked
+# up on the next tick rather than after a full interval.
+cql "
+CREATE TABLE IF NOT EXISTS it.swept (
+    tag_id text, timestamp timestamp, value double,
+    PRIMARY KEY (tag_id, timestamp)
+);
+" > /dev/null
+SWEPT_WIN_MS=$(( (NOW2_MS / 3600000 - 4) * 3600000 ))
+cql "
+INSERT INTO it.swept (tag_id, timestamp, value) VALUES ('s', $(( SWEPT_WIN_MS + 60000 )), 7);
+INSERT INTO it.swept (tag_id, timestamp, value) VALUES ('s', $(( SWEPT_WIN_MS + 120000 )), 8);
+" > /dev/null
+cql "ALTER TABLE it.swept WITH extensions = {'timeseries_tiering': '$TIERING_JSON'};" > /dev/null
+
+printf '   waiting for the background sweeper (no nodetool retier)'
+SWEPT_CHUNKS=""
+for _ in $(seq 1 30); do
+    SWEPT_CHUNKS=$(cql "SELECT count(*) FROM it.swept__chunks WHERE tag_id='s';" | grep -E '^ *[0-9]+$' | tr -dc '0-9')
+    [ "${SWEPT_CHUNKS:-0}" -ge 1 ] 2> /dev/null && break
+    printf '.'; sleep 5
+done
+echo
+assert "the sweeper encoded the closed window on its own" "${SWEPT_CHUNKS:-<none>}" "1"
+check "and the rows still read back through the merge" \
+    "SELECT count(*) FROM it.swept
+      WHERE tag_id='s' AND timestamp >= $SWEPT_WIN_MS AND timestamp < $(( SWEPT_WIN_MS + 3600000 ));" \
+    '^ *2$'
+
 section "restart: everything above survives a real process boot"
 # Every assertion so far ran against a node that has been up the whole time, with schema in memory
 # and data possibly still in memtables. The failure class this covers is the one that only appears

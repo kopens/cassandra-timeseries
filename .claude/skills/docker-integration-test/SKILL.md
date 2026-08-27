@@ -92,6 +92,28 @@ Two rules it enforces so the gate keeps meaning something:
   perf gate quietly stops existing. Re-record only for a deliberate trade, in the same commit as the
   change, and say so in the message.
 
+**What a healthy run looks like.** On an unchanged tree against its own baseline, 24 of 27
+benchmarks land within ±3% and the worst sits near +18%. That spread is the floor of this machine's
+noise, not slack in the gate — which is why the threshold is 25% rather than something tighter, and
+why both sides take the minimum of `PERF_PASSES` sweeps (3). A single sweep moved one benchmark
+across 545 / 433 / 393 µs on the same commit, so a comparison built on one sweep either hides a real
+40% regression or invents one.
+
+**Reading the result.** The long benchmarks are the trustworthy ones: `ChunkReadBench.fullScan`
+(~758 µs for 3,600 rows × 8 columns) barely moves between runs, while sub-microsecond entries like
+`ChunkPresenceBench.decode[mode=ALL_PRESENT]` are mostly noise at this scale — a large percentage on
+a 0.006 µs number is not a finding. Two entries are worth knowing by name because they pin design
+decisions rather than raw speed: `fullScan` against `fullScanBySlot` (~393 µs) is the cost of the
+cursor's name lookup, and `rankPerRow` (~8.7 µs) against `runningIndex` (~1.2 µs) is the running
+value-index rule the v4 cursor enforces with `rankCalls() == 0`. A regression that closes either gap
+means a design invariant broke, not that something got slower.
+
+**The benchmarks are not the product measurement.** `ci-perf` says "the decode path did not get
+slower". It says nothing about query latency on real data — that is
+[tiering-benchmark.md](../../../doc/timeseries/tiering-benchmark.md) (host 234: storage 7.1× smaller,
+aggregates 3–6× faster, re-encode 108k rows/s), and those figures do not transfer to the production
+node either. Quote the right one for the question being asked.
+
 ## 4. Before enabling tiered storage on real data
 
 Tiering deletes the base rows. From that moment `<table>__chunks` is the only copy, a build that
