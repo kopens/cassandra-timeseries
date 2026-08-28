@@ -33,12 +33,17 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.marshal.DoubleType;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.timeseries.ChunkV4Codec;
 import org.apache.cassandra.db.timeseries.ChunkV4Directory;
 import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
 import org.apache.cassandra.db.timeseries.ColumnarCursor;
 import org.apache.cassandra.db.timeseries.StatOrder;
 import org.apache.cassandra.db.timeseries.tiering.TieredStorageService.TierRunStats;
+import org.apache.cassandra.dht.ByteOrderedPartitioner;
+import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -849,6 +854,46 @@ public class TieredStorageServiceTest extends CQLTester
         // And every tag the walk discovered was encoded -- the point of discovering them.
         for (int t = 0; t < 6; t++)
             assertEquals("tag" + t + " should have been chunked", 1, execute(chunkSelectQuery(), "tag" + t, new Date(0L)).size());
+    }
+
+    /**
+     * The tag walk's failure lever is the token span, not the LIMIT: a DISTINCT page pays for every
+     * partition it walks past, not the ones it returns, so shrinking the LIMIT of a too-expensive
+     * stretch shrinks the answer and never the work. {@code boundedScanUpper} is that lever's maths:
+     * each consecutive failure halves the stretch the next page covers, from wherever the cursor is.
+     */
+    @Test
+    public void boundedScanUpperHalvesTheStretchPerFailure()
+    {
+        IPartitioner p = Murmur3Partitioner.instance;
+
+        // No failures: the machinery costs nothing -- unbounded, exactly the pre-existing walk.
+        assertNull(TieredStorageService.boundedScanUpper(p, null, 0));
+
+        // Each failure halves the stretch: strictly shrinking upper bounds, all inside the ring.
+        Token min = p.getMinimumToken();
+        Token max = p.getMaximumTokenForSplitting();
+        Token previous = max;
+        for (int failures = 1; failures <= 6; failures++)
+        {
+            Token upper = TieredStorageService.boundedScanUpper(p, null, failures);
+            assertNotNull(upper);
+            assertTrue("upper must lie inside the ring", min.compareTo(upper) < 0 && upper.compareTo(max) < 0);
+            assertTrue("failure " + failures + " must shrink the stretch", upper.compareTo(previous) < 0);
+            previous = upper;
+        }
+
+        // From a mid-ring cursor the stretch starts there, not at the ring's start.
+        Token cursor = p.getToken(UTF8Type.instance.decompose("mid-ring-cursor"));
+        Token fromCursor = TieredStorageService.boundedScanUpper(p, cursor, 3);
+        assertNotNull(fromCursor);
+        assertTrue("the bound must lie beyond the cursor", cursor.compareTo(fromCursor) < 0);
+
+        // The halving is capped, not unbounded: absurd failure counts still yield a usable span.
+        assertNotNull(TieredStorageService.boundedScanUpper(p, null, 1000));
+
+        // A partitioner that cannot split token ranges keeps the original LIMIT-only behaviour.
+        assertNull(TieredStorageService.boundedScanUpper(ByteOrderedPartitioner.instance, null, 3));
     }
 
     /** @return how many tags are in the current table's registry. */

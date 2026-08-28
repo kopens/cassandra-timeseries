@@ -60,6 +60,7 @@ import org.apache.cassandra.db.timeseries.ColumnarChunkCodec;
 import org.apache.cassandra.db.timeseries.ColumnarCursor;
 import org.apache.cassandra.db.timeseries.StatOrder;
 import org.apache.cassandra.db.timeseries.UnsupportedChunkFormatException;
+import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -1262,22 +1263,35 @@ public class TieredStorageService implements TieredStorageServiceMBean
         AbstractType<?> tokenType = base.partitioner.getTokenValidator();
         String tokenAlias = tokenAlias(base);
 
-        // Halve the page for every consecutive cycle that has failed here, down to a single tag.
-        // Repeating the identical request that just timed out cannot succeed, and the cursor does not
-        // advance past a failure -- so without this a page that is merely too expensive stalls the
-        // walk forever and everything beyond it in the ring is never discovered. Asking for less is
-        // the one thing that might work.
+        // The lever a failure pulls is the page's TOKEN SPAN, not its LIMIT. A DISTINCT page's cost
+        // is the partitions it must WALK, not the ones it returns: LIMIT counts only partitions with
+        // a live row, so a page at any LIMIT still pays to prove every already-tiered partition
+        // between the cursor and its first live hits dead -- and the partitions the re-encoder has
+        // emptied are precisely the expensive ones, a wall of range tombstones each. Observed on
+        // pp.tm_asset_data_based_second (2026-08-29): the walk at cursor null failed at pages 256,
+        // 128 and 64 alike, because shrinking the LIMIT shrinks the answer, never the walk. Halving
+        // the token span halves the walk -- and it turns an empty page into progress, because a
+        // bounded stretch that was scanned and held nothing live is ground covered: the cursor
+        // advances to the span's end. A stretch too expensive at any width is stepped over after
+        // finitely many halvings instead of stalling the walk forever.
         int failures = TagRegistry.consecutiveScanFailures(base);
-        int pageSize = Math.max(1, TAG_PAGE_SIZE >> Math.min(failures, 8));
+        int pageSize = TAG_PAGE_SIZE;
+        Token spanUpper = boundedScanUpper(base.partitioner, TagRegistry.scanCursor(base), failures);
         if (failures > 0)
             logger.info("Tiered storage: {}.{}'s tag walk has failed {} cycle(s) at its current position; " +
-                        "retrying with a page of {} instead of {}",
-                        base.keyspace, base.name, failures, pageSize, TAG_PAGE_SIZE);
+                        "retrying over {} of the remaining ring{}",
+                        base.keyspace, base.name, failures,
+                        spanUpper == null ? "all" : "1/" + (1L << Math.min(failures, MAX_SPAN_HALVINGS)),
+                        spanUpper == null ? " (partitioner cannot split token ranges)" : "");
 
         String query = format("SELECT DISTINCT %s, token(%s) AS %s FROM %s WHERE token(%s) > ? LIMIT %d",
                               tagCqlList, tagCqlList, tokenAlias, baseRef, tagCqlList, pageSize);
         String firstPage = format("SELECT DISTINCT %s, token(%s) AS %s FROM %s LIMIT %d",
                                   tagCqlList, tagCqlList, tokenAlias, baseRef, pageSize);
+        String boundedQuery = format("SELECT DISTINCT %s, token(%s) AS %s FROM %s WHERE token(%s) > ? AND token(%s) <= ? LIMIT %d",
+                                     tagCqlList, tagCqlList, tokenAlias, baseRef, tagCqlList, tagCqlList, pageSize);
+        String boundedFirstPage = format("SELECT DISTINCT %s, token(%s) AS %s FROM %s WHERE token(%s) <= ? LIMIT %d",
+                                         tagCqlList, tagCqlList, tokenAlias, baseRef, tagCqlList, pageSize);
 
         for (int page = 0; page < scanPagesPerCycle; page++)
         {
@@ -1285,21 +1299,30 @@ public class TieredStorageService implements TieredStorageServiceMBean
             List<UntypedResultSet.Row> rows;
             try
             {
-                rows = cursor == null
-                       ? pagedSelect(firstPage, cl, Collections.emptyList(), Integer.MAX_VALUE, pageSize)
-                       : pagedSelect(query, cl,
-                                     Collections.singletonList(tokenType.decomposeUntyped(cursor.getTokenValue())),
-                                     Integer.MAX_VALUE, pageSize);
+                ByteBuffer upperRaw = spanUpper == null ? null : tokenType.decomposeUntyped(spanUpper.getTokenValue());
+                if (cursor == null)
+                    rows = spanUpper == null
+                           ? pagedSelect(firstPage, cl, Collections.emptyList(), Integer.MAX_VALUE, pageSize)
+                           : pagedSelect(boundedFirstPage, cl, Collections.singletonList(upperRaw), Integer.MAX_VALUE, pageSize);
+                else
+                {
+                    ByteBuffer cursorRaw = tokenType.decomposeUntyped(cursor.getTokenValue());
+                    rows = spanUpper == null
+                           ? pagedSelect(query, cl, Collections.singletonList(cursorRaw), Integer.MAX_VALUE, pageSize)
+                           : pagedSelect(boundedQuery, cl, List.of(cursorRaw, upperRaw), Integer.MAX_VALUE, pageSize);
+                }
             }
             catch (RuntimeException e)
             {
-                // The cursor is untouched, so the next cycle retries exactly here. Counted, because a
-                // cycle whose discovery made no progress has not done everything it was asked to.
+                // The cursor is untouched, so the next cycle retries exactly here -- over half the
+                // span. Counted, because a cycle whose discovery made no progress has not done
+                // everything it was asked to.
                 stats.tagsSkipped++;
                 TagRegistry.recordScanFailure(base);
-                logger.warn("Tiered storage: {}.{}'s incremental tag scan failed at cursor {} with a page of {}; " +
-                            "retrying from the same position, with a smaller page, next cycle",
-                            base.keyspace, base.name, cursor, pageSize, e);
+                logger.warn("Tiered storage: {}.{}'s incremental tag scan failed at cursor {} over {} of the " +
+                            "remaining ring; retrying from the same position over a smaller span next cycle",
+                            base.keyspace, base.name, cursor,
+                            spanUpper == null ? "all" : "1/" + (1L << Math.min(failures, MAX_SPAN_HALVINGS)), e);
                 return;
             }
 
@@ -1313,19 +1336,61 @@ public class TieredStorageService implements TieredStorageServiceMBean
 
             TagRegistry.clearScanFailures(base);
 
-            if (rows.isEmpty() || rows.size() < pageSize)
+            if (rows.size() >= pageSize)
             {
-                // The ring is exhausted: a full pass is done. Rewind so the next pass picks up tags
-                // created since, and record the pass so the reconcile interval is honoured.
-                TagRegistry.rewindScanCursor(base);
-                TagRegistry.reconcileAttempted(base);
-                return;
+                // The LIMIT was the binding constraint: ground beyond the last row is unscanned,
+                // bounded span or not, so the cursor advances only to where the walk actually got.
+                UntypedResultSet.Row last = rows.get(rows.size() - 1);
+                TagRegistry.advanceScanCursor(base, base.partitioner.getTokenFactory()
+                                                                    .fromByteArray(last.getBytes(tokenAlias)));
+                spanUpper = null; // the shrunken span did its job; resume at full width
+                continue;
             }
 
-            UntypedResultSet.Row last = rows.get(rows.size() - 1);
-            TagRegistry.advanceScanCursor(base, base.partitioner.getTokenFactory()
-                                                                .fromByteArray(last.getBytes(tokenAlias)));
+            if (spanUpper != null)
+            {
+                // A short page of a BOUNDED span is not exhaustion -- it means the whole stretch up
+                // to spanUpper was scanned. That is the progress the halving exists to buy: advance
+                // past it and resume at full width within the same cycle's page budget.
+                TagRegistry.advanceScanCursor(base, spanUpper);
+                spanUpper = null;
+                continue;
+            }
+
+            // A short UNBOUNDED page means the ring is exhausted: a full pass is done. Rewind so the
+            // next pass picks up tags created since, and record the pass so the reconcile interval
+            // is honoured.
+            TagRegistry.rewindScanCursor(base);
+            TagRegistry.reconcileAttempted(base);
+            return;
         }
+    }
+
+    /** Span halvings are capped: beyond this the stretch is one 2^-{@value}th of the ring and still failing. */
+    @VisibleForTesting
+    static final int MAX_SPAN_HALVINGS = 20;
+
+    /**
+     * The upper token bound for the next tag-scan page, or {@code null} for an unbounded page.
+     * Unbounded when nothing has failed (the common case pays nothing for this machinery), and when
+     * the partitioner cannot split token ranges (no {@link IPartitioner#splitter()}), where the walk
+     * keeps its original LIMIT-only behaviour.
+     * <p>
+     * The bound is the token {@code 1/2^failures} of the way from the cursor to the ring's end, so
+     * each consecutive failure halves the stretch the next page walks. A degenerate split (the
+     * stretch is already too narrow for the partitioner to subdivide) falls back to unbounded rather
+     * than issuing a zero-width page that could never return anything.
+     */
+    @VisibleForTesting
+    static Token boundedScanUpper(IPartitioner partitioner, Token cursor, int failures)
+    {
+        if (failures <= 0 || partitioner.splitter().isEmpty())
+            return null;
+        Token left = cursor != null ? cursor : partitioner.getMinimumToken();
+        Token right = partitioner.getMaximumTokenForSplitting();
+        double fraction = 1.0 / (double) (1L << Math.min(failures, MAX_SPAN_HALVINGS));
+        Token upper = partitioner.split(left, right, fraction);
+        return upper.equals(left) || upper.equals(right) ? null : upper;
     }
 
     /**
