@@ -307,6 +307,33 @@ ALTER TABLE pp.tm_tag_point WITH compaction = {
 
 ---
 
+## 4.5 배포 후 운영 스모크 — 필수
+
+jar 교체 후 §0.6의 기동 확인(UN·oom_score_adj)에 더해, **시계열 함수 배터리를 운영 실데이터로 한
+번 돌리는 것까지가 배포 검증이다** (2026-08-29부터 필수 절차). 활성 태그 하나와 **콜드(청크화된)
+시간 범위**를 골라서 실행한다 — 콜드 범위를 쓰는 것이 핵심인데, 같은 쿼리가 투명 티어드 읽기(청크
+병합)까지 함께 검증하기 때문이다. 이 스키마에서 수치 집계는 `latency`(항상 존재)로, `value`는
+`first`/`last`만 가능하다는 점을 기억할 것(§3.1의 함정).
+
+```sql
+-- ① 다운샘플링: 버킷별 count/avg/min/max가 상식적 값인지
+SELECT time_bucket(1h, timestamp), count(*), avg(latency), min(latency), max(latency)
+FROM pp.tm_tag_point WHERE tag_id=? AND timestamp >= ? AND timestamp < ?
+GROUP BY tag_id, time_bucket(1h, timestamp);
+-- ② 순서 의존 계열: first/last(value), delta/rate/derivative(latency)
+-- ③ 분포: percentile(latency,0.5), percentile(latency,0.95), stddev, approx_count_distinct
+-- ④ 시간가중: time_weighted_average(latency,timestamp), integral(latency,timestamp)
+-- ⑤ 갭필 (DESC 테이블이므로 ORDER BY timestamp ASC 필수):
+SELECT time_bucket_gapfill(1h, timestamp, ?, ?), locf(avg(latency))
+FROM pp.tm_tag_point WHERE tag_id=? AND timestamp >= ? AND timestamp < ?
+GROUP BY tag_id, time_bucket_gapfill(1h, timestamp, ?, ?) ORDER BY timestamp ASC;
+```
+
+통과 기준: 다섯 묶음 전부 타임아웃 없이 결과를 내고, ①의 버킷 수가 기대 범위와 맞고, ⑤가 ①에
+없던 빈 버킷을 만들어 직전 값으로 채우는 것(그것이 gap-fill이 실제로 동작한다는 증거다).
+v6.0.0 배포(2026-08-28~29)에서 이 배터리의 실측 예: 8/26 콜드 6시간 범위에서 5묶음 전부 정상,
+16:00 빈 버킷이 locf로 64를 이어받음.
+
 ## 5. 검증 항목
 
 ```sql
