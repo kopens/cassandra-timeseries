@@ -73,6 +73,28 @@
   `org.apache.cassandra.metrics:type=BufferPool,scope=chunk-cache,name=Size`(풀 자체).
   강제 GC(`jcmd <pid> GC.run`)로 줄지 않는 다이렉트 총량은 라이브 참조입니다.
 
+## 2.0 파킹 실측과 테이블별 처방 (2026-08-28)
+
+재기동 직후 파킹된 63창 / 15테이블의 전수 실측이다. 파티션 크기는 `nodetool tablestats`의
+compacted max/mean, 예산은 `WindowRoutingIterator.maxBufferedBytesPerPartition` = 64 MiB.
+
+**A그룹 — 예산 초과가 원인 (코드 기전과 일치, 확정):**
+
+| 테이블 | 파티션 max / mean | 파티션 키 | 처방 |
+| --- | --- | --- | --- |
+| `tm_tag_point_snapshot` | **1.16 GB** / 65 MB | `((site_id, snapshot_id, date), timestamp)` | 파티션 키에 시간 세분(시간 단위 등) 추가, 또는 `window_size` 확대로 경계 걸침 빈도 축소 |
+| `tm_flow_log` | 668 MB / **144 MB** | `(bucket, ts, log_id)` | `bucket` 입도를 좁혀 파티션 축소 — mean이 예산의 2.3배라 창마다 걸릴 수 있는 상태 |
+| `tm_option_listener_push_cache` | 187 MB / 0.2 MB | `(url, timestamp)` | 소수 핫 url의 아웃라이어. 캐시 성격이면 TSCS가 아니라 UCS가 맞는지부터 재검토 |
+
+**B그룹 — 예산 안쪽인데 파킹됨 (기전 미확정, 잠재 버그 후보):** `tm_asset_ram`,
+`tm_asset_ram_history_by_{timestamp,site,area}`, `tm_asset_oee_history_by_{timestamp,site,area}`,
+`tm_asset_aggregation_by_{site,area}`, `tm_asset_ems_history_by_timestamp` — max 30~52 MB로 전부
+예산 미만이다. 표본 조사(`tm_asset_ram_history_by_timestamp`의 파킹 sstable): **5/26~6/18,
+23일치 쓰기 타임스탬프가 한 sstable**, 209,690행, 툼스톤 0. TSCS 적용 이전에 컴팩션된 레거시
+걸침 sstable로, 크기상 분할이 가능해야 하는데 split-refreeze가 무진전으로 파킹됐다 — §2가
+설명하는 "오버플로했을 때만"과 어긋나므로 **분할 경로의 잠재 버그로 조사할 것**(해당 sstable을
+재현 표본으로 보존 권장). 여파는 A그룹과 같이 무해하고 `retention`이 회수한다.
+
 ## 2. 파킹된 창 진단
 
 > **"해결됨"이라고 적혀 있던 주장은 틀렸습니다 (2026-08-28 실측으로 정정).** 이 절의 이전 판은
