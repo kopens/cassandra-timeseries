@@ -329,10 +329,31 @@ FROM pp.tm_tag_point WHERE tag_id=? AND timestamp >= ? AND timestamp < ?
 GROUP BY tag_id, time_bucket_gapfill(1h, timestamp, ?, ?) ORDER BY timestamp ASC;
 ```
 
-통과 기준: 다섯 묶음 전부 타임아웃 없이 결과를 내고, ①의 버킷 수가 기대 범위와 맞고, ⑤가 ①에
-없던 빈 버킷을 만들어 직전 값으로 채우는 것(그것이 gap-fill이 실제로 동작한다는 증거다).
-v6.0.0 배포(2026-08-28~29)에서 이 배터리의 실측 예: 8/26 콜드 6시간 범위에서 5묶음 전부 정상,
-16:00 빈 버킷이 locf로 64를 이어받음.
+읽기 다섯 묶음에 더해 **쓰기·경계·생존 네 묶음**(v6.0.0 배포 검증에서 추가·실측):
+
+```sql
+-- ⑥ hot 쓰기/삭제 — 합성 태그로, 전부 성공해야 함. 커버리지 원장 버그(v6.0.0에서 수정)가
+--    부수던 경로가 정확히 이것이라, 이 한 쌍이 그 회귀를 배포마다 재확인한다.
+INSERT INTO pp.tm_tag_point (tag_id, timestamp, latency, quality, value)
+     VALUES ('SMOKE-TEST', <now_ms>, 1, 192, 'smoke');
+SELECT value FROM pp.tm_tag_point WHERE tag_id='SMOKE-TEST' AND timestamp=<now_ms>;
+DELETE FROM pp.tm_tag_point WHERE tag_id='SMOKE-TEST' AND timestamp=<now_ms>;
+-- ⑦ cold 삭제 시도 — 반드시 거부돼야 함(에러 메시지에 immutable / cold_window).
+--    가드는 행 존재와 무관하게 클러스터링 경계로 판정하므로, 합성 태그의 오래된 클러스터링에
+--    시도하면 실데이터 위험이 0이다. 이것이 "성공"하면 그 자체가 결함 신호다.
+DELETE FROM pp.tm_tag_point WHERE tag_id='SMOKE-TEST' AND timestamp=<now_ms - hot_window - 2h>;
+-- ⑧ hot/cold 경계 걸침 읽기 — 콜드에 데이터가 있는 시작점부터 now까지. count가 콜드 행 수와
+--    맞고, LIMIT 1(DESC 기본)과 ORDER BY timestamp ASC LIMIT 1이 양 끝 행을 정확히 돌려줄 것.
+--    (경계 산술이 틀리면 콜드 행 0개를 에러 없이 돌려주던 버그 계열을 이 끝점 쌍이 고정한다.)
+-- ⑨ 티어링 생존 — nodetool tieringstatus에서 운영 테이블들의 Last Run이 interval의 2배 안이고
+--    Tags Skipped가 직전 확인 대비 증가하지 않을 것.
+```
+
+통과 기준: 아홉 묶음 전부 타임아웃 없이 기대 결과를 내고, ⑤가 ①에 없던 빈 버킷을 직전 값으로
+채우고(그것이 gap-fill이 실제로 동작한다는 증거), ⑦만 유일하게 **실패(거부)가 정답**이다.
+v6.0.0 배포(2026-08-28~29) 실측 예: 8/26 콜드 6시간 범위에서 ①~⑤ 정상(16:00 빈 버킷 locf=64),
+⑥ 통과, ⑦ `immutable`/`cold_window`로 거부, ⑧ 8,026행 병합 + 양방향 끝점 정확,
+⑨ Last Run 170s/17s (interval 300s).
 
 ## 5. 검증 항목
 
