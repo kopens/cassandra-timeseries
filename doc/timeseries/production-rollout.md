@@ -349,11 +349,20 @@ DELETE FROM pp.tm_tag_point WHERE tag_id='SMOKE-TEST' AND timestamp=<now_ms - ho
 --    Tags Skipped가 직전 확인 대비 증가하지 않을 것.
 ```
 
-통과 기준: 아홉 묶음 전부 타임아웃 없이 기대 결과를 내고, ⑤가 ①에 없던 빈 버킷을 직전 값으로
+```sql
+-- ⑩ SAI LIKE (풀텍스트) — 운영 테이블에는 index_analyzer 인덱스가 없으므로 전용 스모크
+--    픽스처 tstest.smoke_fulltext(4행, ngram SAI 인덱스, 배포마다 재사용)로 배포된 바이너리의
+--    analyzer 경로를 검증한다. 여섯 쿼리와 기대값:
+--    '%timeout%'→1  '%imeou%'(단어 중간)→1  '%정지%'→1  '%프 정%'(공백 걸침)→1
+--    'connection%'→2  = 'connection refused'(완전일치 유지)→1
+SELECT count(*) FROM tstest.smoke_fulltext WHERE device='pump-01' AND msg LIKE '%timeout%';
+```
+
+통과 기준: 열 묶음 전부 타임아웃 없이 기대 결과를 내고, ⑤가 ①에 없던 빈 버킷을 직전 값으로
 채우고(그것이 gap-fill이 실제로 동작한다는 증거), ⑦만 유일하게 **실패(거부)가 정답**이다.
 v6.0.0 배포(2026-08-28~29) 실측 예: 8/26 콜드 6시간 범위에서 ①~⑤ 정상(16:00 빈 버킷 locf=64),
 ⑥ 통과, ⑦ `immutable`/`cold_window`로 거부, ⑧ 8,026행 병합 + 양방향 끝점 정확,
-⑨ Last Run 170s/17s (interval 300s).
+⑨ Last Run 170s/17s (interval 300s), ⑩ 여섯 쿼리 전부 기대값 일치(한국어 공백 걸침 포함).
 
 ## 5. 검증 항목
 
