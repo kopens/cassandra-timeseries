@@ -86,14 +86,23 @@ compacted max/mean, 예산은 `WindowRoutingIterator.maxBufferedBytesPerPartitio
 | `tm_flow_log` | 668 MB / **144 MB** | `(bucket, ts, log_id)` | `bucket` 입도를 좁혀 파티션 축소 — mean이 예산의 2.3배라 창마다 걸릴 수 있는 상태 |
 | `tm_option_listener_push_cache` | 187 MB / 0.2 MB | `(url, timestamp)` | 소수 핫 url의 아웃라이어. 캐시 성격이면 TSCS가 아니라 UCS가 맞는지부터 재검토 |
 
-**B그룹 — 예산 안쪽인데 파킹됨 (기전 미확정, 잠재 버그 후보):** `tm_asset_ram`,
-`tm_asset_ram_history_by_{timestamp,site,area}`, `tm_asset_oee_history_by_{timestamp,site,area}`,
-`tm_asset_aggregation_by_{site,area}`, `tm_asset_ems_history_by_timestamp` — max 30~52 MB로 전부
-예산 미만이다. 표본 조사(`tm_asset_ram_history_by_timestamp`의 파킹 sstable): **5/26~6/18,
-23일치 쓰기 타임스탬프가 한 sstable**, 209,690행, 툼스톤 0. TSCS 적용 이전에 컴팩션된 레거시
-걸침 sstable로, 크기상 분할이 가능해야 하는데 split-refreeze가 무진전으로 파킹됐다 — §2가
-설명하는 "오버플로했을 때만"과 어긋나므로 **분할 경로의 잠재 버그로 조사할 것**(해당 sstable을
-재현 표본으로 보존 권장). 여파는 A그룹과 같이 무해하고 `retention`이 회수한다.
+**B그룹 — 같은 기전, 압축이 가렸을 뿐 (조사로 확정, 이 절의 이전 판이 "잠재 버그"라 했던
+분류는 틀렸다):** `tm_asset_ram`, `tm_asset_ram_history_by_{timestamp,site,area}`,
+`tm_asset_oee_history_by_{timestamp,site,area}`, `tm_asset_aggregation_by_{site,area}`,
+`tm_asset_ems_history_by_timestamp` — `tablestats` max 30~52 MB는 예산 미만처럼 보이지만
+**그 수치는 압축된 디스크 바이트이고 라우팅 예산은 비압축 직렬화 바이트를 센다.** 이 테이블들의
+압축비는 0.079(12.7×)라 디스크 30 MB ≈ **비압축 ~380 MB**로 예산을 6배 초과한다. 로그가
+직접 증언한다: 같은 밤 overflow WARN 44건이 B그룹 전 테이블에 대해 초과한 파티션 키까지
+명시했다(`Partition ... "ASSET_DJ_M_01_1" ... exceeded the 67108864-byte window-routing buffer`).
+
+**진단 규칙 두 가지가 이 오류에서 나온다:** ① 파킹 원인 판정에는 `tablestats`가 아니라
+**overflow WARN**을 먼저 보라 — 초과 파티션을 이름까지 찍어주며, `tablestats`와 예산은 압축
+전후라 직접 비교할 수 없다. ② 그 WARN은 NoSpamLogger로 분당 1건씩 테이블별 제한되므로
+개수가 아니라 **존재 여부**로 읽어라(§2의 "silently parked" 관찰 참고).
+
+처방은 A그룹과 같다 — 파티션이 비압축 기준으로 너무 크다. asset 단위 무한 파티션이므로
+파티션 키에 굵은 시간 버킷을 추가하는 것이 근본 처방이고, 여파는 무해하며 `retention`이
+회수한다는 점도 같다.
 
 ## 2. 파킹된 창 진단
 
