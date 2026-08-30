@@ -1010,8 +1010,10 @@ public class TieredStorageService implements TieredStorageServiceMBean
                 // still the safe response: no rows are deleted, so nothing further is lost.
                 stats.tagsSkipped++;
                 logger.error("Tiered storage runOnce: {}.{} cannot re-encode tag {}: its existing chunk was written " +
-                             "by an older build and is unreadable ({}). Retrying will not fix this -- drop {} and " +
-                             "let tiering re-run; that data is not recoverable. Source rows are left untouched.",
+                             "by an older build and is unreadable ({}). Retrying will not fix this -- detach the " +
+                             "tiering policy, drop {}, then re-attach the policy and let tiering re-run " +
+                             "(DROP refuses while the policy is attached); that data is not recoverable. " +
+                             "Source rows are left untouched.",
                              keyspace, table, describeTag(tagColumns, tag), e.getMessage(),
                              ChunkTables.chunkTableName(table));
             }

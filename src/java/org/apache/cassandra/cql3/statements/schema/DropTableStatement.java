@@ -17,12 +17,15 @@
  */
 package org.apache.cassandra.cql3.statements.schema;
 
+import java.util.List;
+
 import org.apache.cassandra.audit.AuditLogContext;
 import org.apache.cassandra.audit.AuditLogEntryType;
 import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.QualifiedName;
 import org.apache.cassandra.db.guardrails.Guardrails;
+import org.apache.cassandra.db.timeseries.tiering.ChunkTables;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.Keyspaces;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
@@ -41,6 +44,7 @@ import org.apache.cassandra.transport.Event.SchemaChange.Target;
 
 import static com.google.common.collect.Iterables.isEmpty;
 import static com.google.common.collect.Iterables.transform;
+import static java.lang.String.format;
 import static java.lang.String.join;
 
 public final class DropTableStatement extends AlterSchemaStatement
@@ -112,6 +116,34 @@ public final class DropTableStatement extends AlterSchemaStatement
                       keyspaceName,
                       join(", ", transform(views, ViewMetadata::name)));
         }
+
+        // A tiered table's chunk table holds the only copy of every row the re-encoder moved (the
+        // base copies were deleted when they were encoded), and transparent reads resolve through
+        // the *base* table's name -- so dropping the base while its shadows exist strands the cold
+        // data with no error anywhere. Make destroying it an explicit act on the shadow tables.
+        List<String> shadows = ChunkTables.existingShadowTables(keyspace, tableName);
+        if (!shadows.isEmpty())
+        {
+            String chunkTable = ChunkTables.chunkTableName(tableName);
+            String holdsData = shadows.contains(chunkTable)
+                             ? format(" %s.%s holds the only copy of every tiered row -- the base copies were " +
+                                      "deleted when they were encoded -- so this drop would strand that data " +
+                                      "unreadably.", keyspaceName, chunkTable)
+                             : "";
+            throw ire("Cannot drop %s.%s: its time-series tiering shadow tables still exist (%s).%s " +
+                      "First detach the tiering policy so the sweeper stops recreating them " +
+                      "(ALTER TABLE %s.%s WITH extensions = {}), then DROP the shadow tables, " +
+                      "then re-run this DROP.",
+                      keyspaceName, tableName, join(", ", shadows), holdsData, keyspaceName, tableName);
+        }
+
+        // The reverse direction of the same hazard: dropping the chunk table out from under a base
+        // table whose tiering policy is still attached destroys the only copy of the tiered rows,
+        // and the sweeper then recreates the table empty -- so the loss is silent. Detaching the
+        // policy first is the explicit destruction step the refusal demands.
+        String chunkDropError = ChunkTables.chunkTableDropError(keyspace, tableName);
+        if (chunkDropError != null)
+            throw ire(chunkDropError);
 
         return schema.withAddedOrUpdated(keyspace.withSwapped(keyspace.tables.without(table)));
     }

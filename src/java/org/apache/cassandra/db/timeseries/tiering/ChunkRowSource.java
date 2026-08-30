@@ -585,8 +585,10 @@ final class ChunkRowSource
                 // so on every future read. Fail the query instead, loudly and with the window that
                 // proved it, so the condition is impossible to miss.
                 String detail = format("%s.%s: the chunk for window %s was written by an older build and cannot " +
-                                       "be read (%s). Drop %s and let tiering re-run -- that data is not " +
-                                       "recoverable, its base rows were deleted when it was encoded.",
+                                       "be read (%s). Detach the tiering policy, drop %s, then re-attach the " +
+                                       "policy and let tiering re-run (DROP refuses while the policy is " +
+                                       "attached) -- that data is not recoverable, its base rows were " +
+                                       "deleted when it was encoded.",
                                        metadata.keyspace, metadata.name, window.startDate(),
                                        e.getMessage(), chunkRef(metadata));
                 NoSpamLogger.log(logger, NoSpamLogger.Level.ERROR,

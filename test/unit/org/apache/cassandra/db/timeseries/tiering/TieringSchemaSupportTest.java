@@ -31,6 +31,7 @@ import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.timeseries.tiering.TieredStorageService.TierRunStats;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.schema.ColumnMetadata;
@@ -130,6 +131,82 @@ public class TieringSchemaSupportTest extends CQLTester
         createIndex("CREATE CUSTOM INDEX ON %s(opc_id) USING 'sai'");
 
         assertNull(TieringPolicy.unsupportedSchemaError(metadata()));
+    }
+
+    /**
+     * The chunk table holds the only copy of every tiered row (the base copies are deleted when they
+     * are encoded), and transparent reads resolve through the <em>base</em> table's name -- so a
+     * {@code DROP TABLE} of the base while its shadows exist would strand the cold data silently.
+     * The drop must be refused until the shadows are gone, making their destruction an explicit act.
+     */
+    @Test
+    public void dropOfTheBaseTableIsRefusedWhileShadowTablesExist() throws Throwable
+    {
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        ChunkTables.ensureChunkTable(metadata());
+
+        String base = KEYSPACE + '.' + currentTable();
+        String chunks = KEYSPACE + '.' + ChunkTables.chunkTableName(currentTable());
+        String coverage = KEYSPACE + '.' + ChunkTables.coverageTableName(currentTable());
+        String tags = KEYSPACE + '.' + ChunkTables.tagsTableName(currentTable());
+
+        assertInvalidThrowMessage("tiering shadow tables still exist", InvalidRequestException.class,
+                                  "DROP TABLE " + base);
+        // While the chunk table survives, the refusal says which table holds the data...
+        assertInvalidThrowMessage("only copy", InvalidRequestException.class, "DROP TABLE " + base);
+        // ...and how to proceed.
+        assertInvalidThrowMessage("extensions = {}", InvalidRequestException.class, "DROP TABLE " + base);
+
+        // With the chunk table gone the remaining shadows are metadata-only: still refused (they
+        // would linger as orphans), but without the data-loss sentence.
+        execute("DROP TABLE " + chunks);
+        assertInvalidThrowMessage("tiering shadow tables still exist", InvalidRequestException.class,
+                                  "DROP TABLE " + base);
+
+        execute("DROP TABLE " + coverage);
+        execute("DROP TABLE " + tags);
+        execute("DROP TABLE " + base);
+        assertNull(Schema.instance.getTableMetadata(KEYSPACE, currentTable()));
+    }
+
+    /**
+     * The reverse direction: dropping the chunk table out from under a base table whose policy is
+     * still attached destroys the only copy of the tiered rows, and the sweeper then recreates the
+     * table empty -- so the loss would be silent. Detaching the policy is the explicit step that
+     * unlocks the drop.
+     */
+    @Test
+    public void dropOfTheChunkTableIsRefusedWhileThePolicyIsAttached() throws Throwable
+    {
+        createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        ChunkTables.ensureChunkTable(metadata());
+        alterTable("ALTER TABLE %s WITH extensions = " +
+                   "{'" + TieringPolicy.EXTENSION_KEY + "': '{\"hot_window\":\"12h\"}'};");
+
+        String chunks = KEYSPACE + '.' + ChunkTables.chunkTableName(currentTable());
+        assertInvalidThrowMessage("tiering policy is still attached", InvalidRequestException.class,
+                                  "DROP TABLE " + chunks);
+        assertInvalidThrowMessage("only copy", InvalidRequestException.class, "DROP TABLE " + chunks);
+
+        alterTable("ALTER TABLE %s WITH extensions = {};");
+        schemaChange("DROP TABLE " + chunks);
+        assertNull(Schema.instance.getTableMetadata(KEYSPACE, ChunkTables.chunkTableName(currentTable())));
+    }
+
+    /**
+     * The guard matches on shape, not just on name: a user table that merely reuses the
+     * {@code __chunks} suffix (none of the chunk columns) must not hold the base table's drop hostage.
+     */
+    @Test
+    public void anUnrelatedTableReusingTheChunkSuffixDoesNotBlockTheDrop() throws Throwable
+    {
+        String table = createTable("CREATE TABLE %s (tag text, ts timestamp, value double, PRIMARY KEY (tag, ts))");
+        schemaChange("CREATE TABLE " + KEYSPACE + '.' + table + "__chunks (k text PRIMARY KEY, v int)");
+
+        schemaChange("DROP TABLE " + KEYSPACE + '.' + table);
+        assertNull(Schema.instance.getTableMetadata(KEYSPACE, table));
+
+        schemaChange("DROP TABLE " + KEYSPACE + '.' + table + "__chunks");
     }
 
     /**

@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.db.timeseries.tiering;
 
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -44,11 +45,13 @@ import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.CompactionParams;
+import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableParams;
 import org.apache.cassandra.service.StorageProxy;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Clock;
 
 /**
@@ -112,10 +115,12 @@ public final class ChunkTables
     {
     }
 
+    private static final String CHUNK_SUFFIX = "__chunks";
+
     /** @return the shadow chunk table name for {@code baseTable}, e.g. {@code "metrics__chunks"}. */
     public static String chunkTableName(String baseTable)
     {
-        return baseTable + "__chunks";
+        return baseTable + CHUNK_SUFFIX;
     }
 
     /**
@@ -136,6 +141,79 @@ public final class ChunkTables
     public static String tagsTableName(String baseTable)
     {
         return baseTable + "__tags";
+    }
+
+    /**
+     * @return the names of {@code baseTable}'s tiering shadow tables that still exist in
+     * {@code keyspace} -- {@link #chunkTableName}, {@link #coverageTableName}, {@link #tagsTableName}
+     * -- in that order. Each candidate is shape-checked against the columns this class gives it, so an
+     * unrelated user table that merely reuses one of the names does not count.
+     * <p>
+     * {@code DROP TABLE} consults this to refuse dropping a base table out from under its shadows:
+     * the chunk table holds the <b>only</b> copy of every row the re-encoder tiered (the base copies
+     * were deleted the moment they were encoded), so dropping the base first would strand that data
+     * behind a name nothing reads through -- and transparent reads key off the chunk table, not the
+     * live policy, so the operator gets no other warning.
+     */
+    public static List<String> existingShadowTables(KeyspaceMetadata keyspace, String baseTable)
+    {
+        List<String> present = new ArrayList<>(3);
+
+        TableMetadata chunks = keyspace.tables.getNullable(chunkTableName(baseTable));
+        if (chunks != null && hasColumn(chunks, PAYLOAD_COLUMN) && hasColumn(chunks, CLUSTERING_COLUMN))
+            present.add(chunks.name);
+
+        TableMetadata coverage = keyspace.tables.getNullable(coverageTableName(baseTable));
+        if (coverage != null && hasColumn(coverage, ChunkCoverage.MIN_WINDOW_START))
+            present.add(coverage.name);
+
+        // The registry's one distinguishing column is its scope partition key, whose name is derived
+        // (underscore-prefixed on collision, see tagsScopeColumn) -- so match on the suffix.
+        TableMetadata tags = keyspace.tables.getNullable(tagsTableName(baseTable));
+        if (tags != null && tags.partitionKeyColumns().size() == 1
+                         && tags.partitionKeyColumns().get(0).name.toString().endsWith(TagRegistry.SCOPE_COLUMN))
+            present.add(tags.name);
+
+        return present;
+    }
+
+    /**
+     * @return an error refusing to drop {@code table}, when it is the (shape-verified) chunk table of
+     * a base table that still carries a {@code timeseries_tiering} policy -- else {@code null}.
+     * <p>
+     * The chunk table holds the only copy of every tiered row, and with the policy attached the
+     * sweeper would simply recreate it <em>empty</em> on its next cycle: the data would be gone, the
+     * schema would look whole again, and transparent reads would serve truncated history with no
+     * error anywhere. Detaching the policy first is the explicit "I mean to lose this data" step --
+     * it is also what the unreadable-chunk recovery (see {@code UnsupportedChunkFormatException}
+     * call sites) instructs. Presence of the extension key is what counts, not its validity: an
+     * invalid policy still marks the table as tiered, and the conservative reading is the safe one.
+     */
+    public static String chunkTableDropError(KeyspaceMetadata keyspace, String table)
+    {
+        if (!table.endsWith(CHUNK_SUFFIX))
+            return null;
+
+        TableMetadata base = keyspace.tables.getNullable(table.substring(0, table.length() - CHUNK_SUFFIX.length()));
+        if (base == null || !base.params.extensions.containsKey(TieringPolicy.EXTENSION_KEY))
+            return null;
+
+        TableMetadata chunks = keyspace.tables.getNullable(table);
+        if (chunks == null || !hasColumn(chunks, PAYLOAD_COLUMN) || !hasColumn(chunks, CLUSTERING_COLUMN))
+            return null;
+
+        return String.format("Cannot drop %s.%s: it is the tiered-storage chunk table of %s.%s, whose tiering " +
+                             "policy is still attached. It holds the only copy of every tiered row (the base " +
+                             "copies were deleted when they were encoded), and the sweeper would recreate it " +
+                             "empty on its next cycle -- silently truncated history with no error anywhere. " +
+                             "If losing that data is intended (e.g. recovering from an unreadable chunk format), " +
+                             "detach the policy first (ALTER TABLE %s.%s WITH extensions = {}), then re-run this DROP.",
+                             keyspace.name, table, keyspace.name, base.name, keyspace.name, base.name);
+    }
+
+    private static boolean hasColumn(TableMetadata table, String name)
+    {
+        return table.getColumn(ByteBufferUtil.bytes(name)) != null;
     }
 
     /**
