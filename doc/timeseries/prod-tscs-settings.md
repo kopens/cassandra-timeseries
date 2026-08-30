@@ -101,8 +101,46 @@ compacted max/mean, 예산은 `WindowRoutingIterator.maxBufferedBytesPerPartitio
 개수가 아니라 **존재 여부**로 읽어라(§2의 "silently parked" 관찰 참고).
 
 처방은 A그룹과 같다 — 파티션이 비압축 기준으로 너무 크다. asset 단위 무한 파티션이므로
-파티션 키에 굵은 시간 버킷을 추가하는 것이 근본 처방이고, 여파는 무해하며 `retention`이
-회수한다는 점도 같다.
+파티션 키에 굵은 시간 버킷을 추가하는 것이 근본 처방이다. 단, "`retention`이 회수한다"는
+이 절의 이전 판 서술은 **B그룹에는 틀렸다**: 2026-08-29 스키마 재확인 결과 `tm_asset_*` 10개는
+`retention`도 `default_time_to_live`도 없다(§2.1). 파킹된 창이 영구히 남고 테이블이 무한 성장한다.
+
+## 2.1 테이블별 변경 권고 (2026-08-29 스키마 재확인)
+
+§2.0 전수조사 + 스키마 덤프(`ws`/`retention`/TTL)에서 나온 실행 권고다. 파티션 키는 ALTER로
+바꿀 수 없으므로 "재파티셔닝"은 새 테이블 + 백필 + 앱 변경이 필요한 프로젝트이고, compaction
+옵션은 ALTER 한 줄이다.
+
+**결정 필요 (최우선) — `tm_asset_*` 10개: 보존 정책 부재**
+
+`tm_asset_ram`, `tm_asset_ram_history_by_{timestamp,site,area}`,
+`tm_asset_oee_history_by_{timestamp,site,area}`, `tm_asset_aggregation_by_{site,area}`,
+`tm_asset_ems_history_by_timestamp` — 전부 `ws=7d`, **retention 없음, TTL=0**.
+
+- 결과: ① 무한 성장 ② 파킹 창 23개 영구 잔존 ③ 창 수(= TSCS 읽기 증폭)가 시간에 비례해 증가.
+- ALTER 한 줄 해법(보존 기간은 업무 결정):
+  `ALTER TABLE pp.tm_asset_ram WITH compaction = {'class':'TimeSeriesCompactionStrategy', 'window_size':'7d', 'retention':'365d'};`
+  retention 만료는 창째 드롭이므로 파킹된 창도 함께 회수된다.
+- 근본 해법: 파티션 키에 굵은 시간 버킷 추가(예: `((asset_id, month), timestamp)`) — 프로젝트.
+
+**ALTER 한 줄로 끝나는 것 — `tm_option_listener_push_cache` → UCS**
+
+캐시 워크로드(TTL 1d, ret 7d)인데 TSCS 위에 있고, 핫 url 파티션(187 MB)이 창을 걸쳐 파킹을
+만든다. 시계열이 아니므로 전략 자체를 바꾼다:
+`ALTER TABLE pp.tm_option_listener_push_cache WITH compaction = {'class':'UnifiedCompactionStrategy'};`
+파킹돼 있던 SSTable은 일반 UCS 후보가 되어 자연 해소된다. (단독 UCS 전환은 안전하다 —
+[production-rollout.md](production-rollout.md)의 "UCS로 남은 티어드 테이블" 함정은 tiering
+확장이 걸린 테이블에만 해당.)
+
+**여유 있을 때 (파킹 수명이 retention으로 유계) — 재파티셔닝 프로젝트 2건**
+
+| 테이블 | 설정 | 상태 | 근본 해법 |
+| --- | --- | --- | --- |
+| `tm_tag_point_snapshot` | ws=1d, ret=94d, TTL=93d | max **1.16 GB** 파티션 — 파킹 창은 94일 내 소멸 | 파티션 키에 시간 세분 추가 |
+| `tm_flow_log` | ws=1d, ret=8d, TTL=7d | mean 144 MB — 파킹 수명 ~8일 | `bucket` 입도 축소 |
+
+**변경 불필요:** `tm_tag_point`, `tm_asset_data_based_second` — 티어링 설정 정합(hot 12h ≫
+chunk 15m, cold_window·TTL 일치), 파킹 없음, 순항 중.
 
 ## 2. 파킹된 창 진단
 
