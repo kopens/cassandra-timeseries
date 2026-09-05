@@ -284,6 +284,62 @@ docker-image-publish:
       "$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/cassandra-timeseries-docker/${CI_COMMIT_TAG:-6.0.0}/cassandra-timeseries-6.0.0-docker.tar"
 
 # On tag pushes (e.g. 6.0.0-r1), publish a GitLab Release pointing at the built jar.
+changelog:
+  stage: release
+  # Runs on a tag, before the release job that consumes its output.
+  #
+  # GitLab builds the entries from commits carrying a `Changelog:` trailer (.gitlab/changelog_config.yml).
+  # That trailer is the only thing separating this fork's commits from the ~19,000 upstream ones an
+  # `apache/cassandra` merge drags in, so a fork commit without it is simply absent here.
+  #
+  # Needs CHANGELOG_TOKEN: a project access token with `api` + `write_repository`, and a role that
+  # may push to `main` if the branch is protected. CI_JOB_TOKEN cannot call this API. Without the
+  # variable the job still runs and still produces release notes -- it falls back to the top section
+  # of the CHANGELOG.md that is checked out -- but nothing is written back to the repository.
+  image: alpine:3.20
+  before_script:
+    - apk add --no-cache curl jq
+  rules:
+    - if: $CI_COMMIT_TAG
+  variables:
+    GIT_SUBMODULE_STRATEGY: none
+  script:
+    - |
+      set -eu
+      API="$CI_API_V4_URL/projects/$CI_PROJECT_ID/repository/changelog"
+      if [ -n "${CHANGELOG_TOKEN:-}" ]; then
+        # Write the section into CHANGELOG.md on the default branch. `from` is omitted so GitLab
+        # picks the previous tag itself. [skip ci] keeps this commit from starting another pipeline,
+        # which would otherwise loop on every release.
+        echo "committing CHANGELOG.md for $CI_COMMIT_TAG"
+        curl --fail --silent --show-error --request POST \
+             --header "PRIVATE-TOKEN: $CHANGELOG_TOKEN" \
+             --data "version=$CI_COMMIT_TAG" \
+             --data "branch=$CI_DEFAULT_BRANCH" \
+             --data "message=Changelog: $CI_COMMIT_TAG [skip ci]" \
+             "$API"
+        # Same range again, this time just to capture the text for the release description.
+        curl --fail --silent --show-error \
+             --header "PRIVATE-TOKEN: $CHANGELOG_TOKEN" \
+             "$API?version=$CI_COMMIT_TAG" | jq -r .notes > release-notes.md
+      else
+        echo "CHANGELOG_TOKEN is not set: not writing CHANGELOG.md, falling back to its top section."
+        # Everything after the first '## ' heading up to the next one.
+        awk '/^## /{ if (seen) exit; seen=1; next } seen' CHANGELOG.md > release-notes.md
+      fi
+      # An empty description would publish a release with no notes at all, which is worse than a
+      # pointer -- and with the trailer convention new, an empty result is the likely first outcome.
+      if [ ! -s release-notes.md ]; then
+        echo "no changelog entries found for $CI_COMMIT_TAG" >&2
+        printf 'No changelog entries were generated for %s. See CHANGELOG.md and CHANGES.txt.\n' \
+               "$CI_COMMIT_TAG" > release-notes.md
+      fi
+      cat release-notes.md
+  artifacts:
+    paths:
+      - release-notes.md
+    expire_in: 1 month
+
 release:
   stage: release
   image: registry.gitlab.com/gitlab-org/release-cli:latest
@@ -306,6 +362,8 @@ release:
       artifacts: true
     - job: docker-integration-test
       artifacts: false
+    - job: changelog
+      artifacts: true
   script:
     - |
       PKG="$CI_API_V4_URL/projects/$CI_PROJECT_ID/packages/generic/cassandra-timeseries/$CI_COMMIT_TAG"
@@ -316,7 +374,10 @@ release:
       done
   release:
     tag_name: "$CI_COMMIT_TAG"
-    description: "Industrial time-series Cassandra (base Apache Cassandra 6.0.0) — $CI_COMMIT_TAG"
+    # release-cli reads a description that names an existing file from that file, so this is the
+    # generated changelog section rather than the literal path. The changelog job guarantees the
+    # file exists and is non-empty.
+    description: "./release-notes.md"
     assets:
       links:
         # Generic package registry, not job artifacts. Artifacts expire (see build-jar's

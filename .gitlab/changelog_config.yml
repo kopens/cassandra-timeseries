@@ -1,0 +1,44 @@
+# Configuration for GitLab's changelog generator (Repository > Changelog API).
+#
+# GitLab builds an entry only from a commit that carries the trailer named below, so this file is
+# what keeps the fork's ~100 commits separate from the ~19,000 upstream ones that arrive with every
+# `apache/cassandra` merge. A commit without the trailer is invisible to the generator -- which is
+# the intended behaviour for upstream commits, and the reason a fork commit that omits it silently
+# never reaches CHANGELOG.md.
+#
+# Usage in a commit message (last paragraph, one per commit):
+#
+#     Changelog: fixed
+#
+# See CONTRIBUTING.md ("Changelog entries") for which category to pick.
+
+# The git trailer to look for. GitLab's default is already "Changelog"; it is spelled out here so
+# the convention is discoverable from this file alone.
+trailer: 'Changelog'
+
+# Trailer value -> section heading in CHANGELOG.md. A value not listed here is dropped with a
+# warning in the job log, so keep this list and CONTRIBUTING.md in step.
+categories:
+  added: Added
+  changed: Changed
+  deprecated: Deprecated
+  removed: Removed
+  fixed: Fixed
+  security: Security
+  performance: Performance
+  other: Other
+
+# How one entry is rendered.
+#
+# Author and merge-request links are deliberately omitted: this fork is pushed to directly rather
+# than developed through merge requests, so `entry.merge_request` is nil for effectively every
+# commit and the default template renders a bare "()" for it. The commit link is the useful anchor.
+template: |
+  {% each categories %}
+  ### {{ title }}
+
+  {% each entries %}
+  - {{ title }} ([{{ commit.reference }}]({{ commit.web_url }}))
+  {% end %}
+
+  {% end %}
