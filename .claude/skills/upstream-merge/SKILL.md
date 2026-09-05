@@ -258,3 +258,10 @@ is the part the user cannot see from the diff stat.
 Tell the user: how many upstream commits landed, which files conflicted and how each was resolved,
 anything that needed a code fix to compile, and the test results. Keep it to a short list — they are
 syncing, not reading a report.
+
+**Say it out loud when a dependency version moved.** This fork ships to production as a single jar
+dropped into an existing install's `lib/`, and `doc/timeseries/production-rollout.md` §0.5 documents
+that as "the other jars do not need replacing" — true of the fork's own changes, false the moment an
+upstream merge bumps one. The node then runs new code against an old dependency and dies at
+*runtime*, after the deploy, on `NoSuchMethodError`. So list the bumps from the pom diff above as a
+deployment consequence, not as build trivia.

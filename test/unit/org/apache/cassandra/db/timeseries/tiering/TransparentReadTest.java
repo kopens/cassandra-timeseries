@@ -904,6 +904,14 @@ public class TransparentReadTest extends CQLTester
         assertEquals(19, executeNet("SELECT value FROM %s WHERE tag = 't1'").all().size());
         assertEquals(2, cachedChunkStatements(chunkTable).size());
 
+        // Dropping the chunk table is refused while the policy is attached -- it holds the only copy
+        // of the tiered rows (see TieringSchemaSupportTest#dropOfTheChunkTableIsRefusedWhileThePolicyIsAttached).
+        // Detaching is the step the refusal prescribes; it must not itself evict the chunk statements,
+        // or the assertion below would pass without the drop having done anything.
+        alterTable("ALTER TABLE %s WITH extensions = {};");
+        assertEquals("detaching the policy is not what evicts the chunk statements",
+                     2, cachedChunkStatements(chunkTable).size());
+
         schemaChange("DROP TABLE " + KEYSPACE + '.' + chunkTable);
         assertTrue("statements prepared against a dropped chunk table must not survive it: "
                    + cachedChunkStatements(chunkTable).keySet(),

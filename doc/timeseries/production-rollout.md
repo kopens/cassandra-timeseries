@@ -72,7 +72,7 @@ v4 이전 빌드가 만든 청크(v1/v2/v3)는 읽을 때 `UnsupportedChunkForma
 
 ---
 
-## 0.5 기존 6.0.0에 올리기 — jar 하나만 교체하면 됩니다
+## 0.5 기존 6.0.0에 올리기 — 보통은 jar 하나, 업스트림 머지 뒤에는 확인 후
 
 업스트림(`cassandra-6.0`)과 실제로 비교한 결과입니다:
 
@@ -80,8 +80,29 @@ v4 이전 빌드가 만든 청크(v1/v2/v3)는 읽을 때 `UnsupportedChunkForma
 | --- | --- | --- |
 | `lib/apache-cassandra-6.0.0.jar` | **예** — 포크 코드 전부가 여기 들어 있습니다 | **예** |
 | `bin/` (`nodetool`, `cassandra`, `cqlsh` …) | 아니오 | 아니오 |
-| `lib/` 의 다른 jar | 아니오 — Lucene도 업스트림 SAI가 이미 씁니다 | 아니오 |
+| `lib/` 의 다른 jar | 포크는 안 바꿉니다 — 다만 **업스트림 머지가 의존성 버전을 올리면 바뀝니다** | **머지마다 확인** (아래) |
 | `conf/cassandra.yaml` | 주석 처리된 가이드레일 설명 7줄뿐 | 아니오 |
+
+**업스트림 머지 뒤에는 의존성 버전이 올라갔는지 먼저 확인하십시오.** 포크는 `lib/`를 건드리지
+않지만 업스트림은 올립니다. 그러면 메인 jar만 교체한 노드는 **새 코드 + 낡은 의존성**으로 뜨고,
+컴파일이 아니라 런타임에 `NoSuchMethodError` / `NoClassDefFoundError`로 죽습니다 — 배포 후에야
+드러나는 실패입니다. 2026-09-05 머지가 실제 사례입니다: CASSANDRA-21474가 `NoSpamLogger`를
+Caffeine으로 옮기면서 3.1.8 → 3.2.4를 요구하는데(`Expiry.writing`은 3.2에서 추가됨), 이 호출은
+`NoSpamLogger`의 **필드 초기화**에 있고 그 클래스는 소스 84곳이 씁니다. 3.1.8이 깔린 노드에
+새 jar만 얹으면 기동 직후 터집니다. 같은 머지가 lz4-java 1.10.1 → 1.11.2도 올렸습니다.
+
+확인과 교체:
+
+```bash
+# 이번 릴리스가 요구하는 버전 (빌드 후 lib/ 이 정답지다)
+ls lib/*.jar | sort > /tmp/want.txt
+# 운영 노드에 있는 버전
+ssh <node> 'ls $CASSANDRA_HOME/lib/*.jar' | sort > /tmp/have.txt
+diff /tmp/want.txt /tmp/have.txt     # 버전이 다른 항목이 곧 함께 교체할 jar
+```
+
+버전이 올라간 jar은 **새 것을 넣고 낡은 것을 반드시 지우십시오** — 둘 다 두면 클래스패스에 함께
+올라가고 어느 쪽이 이길지는 순서에 달립니다(0.5 주의 1번과 같은 함정).
 
 `nodetool`은 셸 스크립트이고 `retier`/`tieringstatus` 클래스는 메인 jar 안에 있습니다
 (`org/apache/cassandra/tools/nodetool/Retier.class` 확인). 그래서 스크립트는 건드릴 필요가 없습니다.
