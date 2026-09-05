@@ -241,6 +241,7 @@ public enum CassandraRelevantProperties
     DTEST_ACCORD_ENABLED("jvm_dtest.accord.enabled", "true"),
     DTEST_ACCORD_JOURNAL_SANITY_CHECK_ENABLED("jvm_dtest.accord.journal_sanity_check_enabled", "false"),
     DTEST_API_LOG_TOPOLOGY("cassandra.dtest.api.log.topology"),
+    DTEST_AVOID_SYSTEM_EXIT("jvm_dtest.avoid_system_exit"),
     DTEST_IGNORE_SHUTDOWN_THREADCOUNT("jvm_dtests.ignore_shutdown_threadcount"),
     /** This property indicates if the code is running under the in-jvm dtest framework */
     DTEST_IS_IN_JVM_DTEST("org.apache.cassandra.dtest.is_in_jvm_dtest"),
@@ -407,6 +408,7 @@ public enum CassandraRelevantProperties
     MEMTABLE_OVERHEAD_SIZE("cassandra.memtable.row_overhead_size", "-1"),
     MEMTABLE_SHARD_COUNT("cassandra.memtable.shard.count"),
     MEMTABLE_TRIE_SIZE_LIMIT("cassandra.trie_size_limit_mb"),
+
     METRICS_REPORTER_CONFIG_FILE("cassandra.metricsReporterConfigFile"),
     /** Defines the maximum number of unique timed out queries that will be reported in the logs. Use a negative number to remove any limit. */
     MONITORING_MAX_OPERATIONS("cassandra.monitoring_max_operations", "50"),
@@ -429,6 +431,11 @@ public enum CassandraRelevantProperties
      * This is an optimization used in unit tests becuase we never restart a node there. The only node is stopoped
      * when the JVM terminates. Therefore, we can use such optimization and not wait unnecessarily. */
     NON_GRACEFUL_SHUTDOWN("cassandra.test.messagingService.nonGracefulShutdown"),
+    /**
+     * Maximum number of log statements cached per NoSpamLogger instance.
+     * This prevents unbounded memory growth when log messages contain dynamic content.
+     */
+    NOSPAM_LOGGER_MAX_STATEMENTS_PER_LOGGER("cassandra.nospam_logger.max_statements_per_logger", String.valueOf(1024)),
     /** for specific tests */
     /** This property indicates whether disable_mbean_registration is true */
     ORG_APACHE_CASSANDRA_DISABLE_MBEAN_REGISTRATION("org.apache.cassandra.disable_mbean_registration"),
@@ -659,6 +666,9 @@ public enum CassandraRelevantProperties
     TEST_DIFFERENTIAL_LARGEPARTITION_VALUE_PADDING("cassandra.test.differential.largepartition.value_padding", "240"),
     /** Seed for the randomized differential soak; defaults to the wall clock, logged per example. */
     TEST_DIFFERENTIAL_SEED("cassandra.test.differential.seed"),
+    /** Column counts for the pathological wide-table differential test. */
+    TEST_DIFFERENTIAL_WIDE_REGULARS("cassandra.test.differential.wide.regulars", "1800"),
+    TEST_DIFFERENTIAL_WIDE_STATICS("cassandra.test.differential.wide.statics", "200"),
     TEST_DRIVER_CONNECTION_TIMEOUT_MS("cassandra.test.driver.connection_timeout_ms", "5000"),
     TEST_DRIVER_READ_TIMEOUT_MS("cassandra.test.driver.read_timeout_ms", "12000"),
     TEST_ENCRYPTION("cassandra.test.encryption", "false"),

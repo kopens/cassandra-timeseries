@@ -12,6 +12,17 @@
  * Add SAI full-text search: index_analyzer index option (ngram/standard/cjk/keyword presets or JSON config) enabling substring LIKE ('%fragment%', 'prefix%', '%suffix') on text columns, korean included, served by n-gram recall + raw-value precision recheck
  * Add time-series gap-filling: GROUP BY time_bucket_gapfill(width, ts, start, finish) materializes empty buckets, with locf() and interpolate() fill policies
  * Add native time-series CQL functions: time_bucket, first, last, delta, rate, derivative, percentile, time_weighted_average, variance, stddev, histogram, approx_count_distinct, counter_delta, counter_rate, corr, covar_pop, covar_samp, regr_slope, regr_intercept, regr_r2 and integral
+ * Guardrail configurations of zero are now treated as zero instead of unlimited (CASSANDRA-21517)
+ * Support multi-cell columns in cursor compaction (CASSANDRA-21463)
+ * Optimize authorization logic for BatchStatement and TransactionStatement when a single table is updated (CASSANDRA-21606)
+ * Upgrade lz4-java to 1.11.2 (CASSANDRA-21564)
+ * Encode the CQL as raw bytes to avoid utf string serialization length limitation (CASSANDRA-21599)
+ * Add a guardrail to disallow reconfiguring CMS below a minimum size (CASSANDRA-19195)
+ * Node can report DECOMMISSION_FAILED while actively leaving after a rejected decommission attempt (CASSANDRA-21583)
+ * Make NoSpamLogger to use Caffeine cache instead of unbounded cache that could lead to memory exhaustion (CASSANDRA-21474)
+ * Reduce overheads of isOrdinaryUser check performed by Guardrail.enabled (CASSANDRA-21589)
+ * MultiStepOperations should not encode range movements using endpoints (CASSANDRA-21582)
+ * Avoid "During operation execution,... at ONE the ring has changed from epoch1 to epoch2 error" with counter writes (CASSANDRA-21585)
  * Reject LIKE patterns with a wildcard (%) anywhere other than the start or end (CASSANDRA-21068)
  * Stabilize cursor-based compaction (CASSANDRA-21462)
  * Stop using Java streams in CIDRPermissions.SubsetPermissions#canAccessFrom hot method (CASSANDRA-21588)
@@ -25,12 +36,16 @@
  * Make cqlsh prompt to reset to no keyspace set by USE after dropping that keyspace (CASSANDRA-21548)
  * Implement CMS rediscovery and recovery protocol (CASSANDRA-20476)
 Merged from 5.0:
+ * Unwrap LongType properly when calculating min/max terms in V1SSTableIndex (CASSANDRA-21635)
+ * Force repair should ignore min_repair_interval (CASSANDRA-21552)
+ * Render SubnetGroups as JSON in system_views.settings (CASSANDRA-21579)
  * Avoid rebuilding per-SSTable SAI components unless missing or corrupted (CASSANDRA-21515)
  * Propagate trickle_fsync settings to compressed SSTable writers (CASSANDRA-21487)
  * Allow setCompressedReadAheadBufferSizeInKb(0) to disable read-ahead buffer (CASSANDRA-21522)
  * Fix ThreadLocalReadAheadBuffer#fill() to throw a CorruptBlockException if chunk metadata and file size are out of sync (CASSANDRA-21519)
  * Fix memtable on-heap accounting drift in BTree.update and BTreeRow.merge (CASSANDRA-21472)
 Merged from 4.0:
+ * During streaming Bounds.getNonOverlappingBounds produces incorrect bounds leading to row/counter cache not invalidate correctly (CASSANDRA-21594)
  * Validate authz before performing role check in LIST ROLES/PERMISSIONS (CASSANDRA-21560)
  * Add validation to uncompressed length during decompression (CASSANDRA-21567)
  * Fix regression in PasswordObfuscator for dollar-quoted passwords (CASSANDRA-21559)

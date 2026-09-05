@@ -53,12 +53,25 @@ to undo than an uncommitted one.
 versioning rule requires `6.0.0`, because the build must produce `build/apache-cassandra-6.0.0.jar`
 and the release pipeline renames from that exact path. Keep `<property name="base.version" value="6.0.0"/>`.
 
-**`CHANGES.txt`** — the fork replaced upstream's top version header with `6.0.0` and lists its own
-entries under it. Upstream adds a *new* version section above the old one. Resolve by keeping the
-`6.0.0` header and the fork's entries, appending upstream's new entries (with their
-`Merged from 5.0:` / `Merged from 4.0:` sub-headers intact) below them, and **restoring the version
-header of the section that upstream's new one displaced** — otherwise the older release's entries
-end up looking like they belong to a `Merged from 4.0:` block. Concretely, the shape you want is:
+**`CHANGES.txt`** — conflicts every time. The fork replaced upstream's top version header with
+`6.0.0` and lists its own entries under it. There are two cases, and they resolve differently — check
+which one you are in *before* editing, by comparing the top version header of the merge base with
+upstream's:
+
+```bash
+git show $(git merge-base HEAD MERGE_HEAD):CHANGES.txt | head -1
+git show MERGE_HEAD:CHANGES.txt | grep -n '^6\.0'
+```
+
+*Same top header on both sides* (upstream appended bullets to the section the fork renamed — the
+common case, e.g. the 2026-09-05 merge): there is no displaced header. Just drop the `6.0-alpha3`
+line from upstream's side and let its new bullets follow the fork's under the `6.0.0` header.
+
+*Upstream opened a new version section*: keep the `6.0.0` header and the fork's entries, append
+upstream's new entries (with their `Merged from 5.0:` / `Merged from 4.0:` sub-headers intact) below
+them, and **restore the version header of the section that upstream's new one displaced** —
+otherwise the older release's entries end up looking like they belong to a `Merged from 4.0:` block.
+Concretely, the shape you want is:
 
 ```
 6.0.0
@@ -73,6 +86,26 @@ Merged from 4.0:
 6.0-alpha2          <- header restored, was the top of upstream's previous section
  * <older entries, untouched>
 ```
+
+**`conf/cassandra.yaml` + `conf/cassandra_latest.yaml`** — conflicts most times, and the two files
+conflict identically, so resolve them the same way. The fork's commented-out
+`prepared_statements_require_parameters_*` guardrail block sits at the very end of the guardrails
+section — exactly where upstream appends each new guardrail. Keep both blocks, fork's first, with a
+bare `#` line between them (the separator upstream uses between guardrail entries); do not take a
+side.
+
+**`ModificationStatement.java`** — the fork's `validatePrepare(ClientState)` override (the
+`preparedStatementsRequireParameters` guardrail) sits immediately before the disk-usage code, which
+upstream keeps refactoring. Keep both. Watch the brace: the conflict cuts through the fork's method,
+so `<<<<<<<` holds its body without a closing `}` and the `}` after `>>>>>>>` belongs to upstream's
+method — the resolved text needs a `}` added to close `validatePrepare`.
+
+**`.build/sh/ant-log-summary.py`** — add/add conflict. The fork carried this script before upstream
+shipped its own (`c574262b10`, "Add --summary and --clean to the build scripts"); the files are otherwise identical, and upstream's
+only delta is exiting 2 rather than 1 when the log file cannot be read, which is the better
+behaviour (1 means "the log says BUILD FAILED"). Take theirs. Note that this does **not** fix the
+false-green trap in step 4: upstream's version also prints `BUILD SUCCESSFUL` and exits 0 on empty
+input.
 
 **`debian/changelog`** — keep the fork's `cassandra (6.0.0) unstable; urgency=medium` stanza and
 drop upstream's alpha stanza. One gotcha: this file contains a *pre-existing* stray
@@ -150,6 +183,27 @@ ls -la --time-style=full-iso build/apache-cassandra-6.0.0.jar
 ```
 
 A jar dated before today means it did not rebuild, whatever the log said.
+
+**A dependency bump needs `realclean`, not `clean`.** `lib/` is `${build.lib}` — a gitignored
+download cache, not checked-in jars — and a plain `clean` leaves it alone. So when upstream bumps a
+dependency, the *old* jar stays in `lib/` and shadows the newly resolved one in `build/lib/jars`,
+and the build fails on an API that plainly exists in the version the pom asks for. The 2026-09-05
+merge hit this: CASSANDRA-21474 moved `NoSpamLogger` to Caffeine and bumped 3.1.8 → 3.2.4, and the
+stale `lib/caffeine-3.1.8.jar` produced `error: cannot find symbol ... method writing(...) location:
+interface Expiry`. Diagnose by comparing the pom with what is on disk, and fix by clearing the
+cache — never by editing fork code to the old API:
+
+```bash
+grep -A2 '<artifactId>caffeine</artifactId>' .build/parent-maven-pom.xml   # version the pom wants
+ls lib/ | grep -i caffeine                                                 # version actually there
+.build/sh/ai-in-container 'ant -Dant.gen-doc.skip=true -Drat.skip=true realclean && ant -Dant.gen-doc.skip=true -Drat.skip=true jar checkstyle checkstyle-test'
+```
+
+To spot it before the build, diff the dependency versions the merge brought in:
+
+```bash
+git diff $(git merge-base HEAD MERGE_HEAD)...MERGE_HEAD -- .build/parent-maven-pom.xml | grep -E '^[-+].*<version>'
+```
 
 Compile failures after an upstream merge are usually upstream tightening a signature that fork code
 calls. Read the actual error rather than the summary:
