@@ -32,13 +32,16 @@ categories:
 #
 # Author and merge-request links are deliberately omitted: this fork is pushed to directly rather
 # than developed through merge requests, so `entry.merge_request` is nil for effectively every
-# commit and the default template renders a bare "()" for it. The commit link is the useful anchor.
+# commit and the default template renders a bare "()" for it.
+#
+# The link text is the literal word "commit" rather than {{ commit.reference }}, which expands to
+# `common/cassandra-timeseries@<full 40-char sha>` and buries the entry it is attached to.
 template: |
   {% each categories %}
   ### {{ title }}
 
   {% each entries %}
-  - {{ title }} ([{{ commit.reference }}]({{ commit.web_url }}))
+  - {{ title }} ([commit]({{ commit.web_url }}))
   {% end %}
 
   {% end %}
