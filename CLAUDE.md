@@ -48,10 +48,14 @@ constraints in [doc/timeseries/production-rollout.md](doc/timeseries/production-
   summarizer. Build and test in the container: `.build/sh/ai-build-image`, then
   `.build/sh/ai-in-container '<cmd>'`, or `.build/sh/ci-local` for the whole gate. Both pass
   `--network host`, without which `apt-get` cannot resolve `archive.ubuntu.com` here.
-- **GitLab CI has confirmed nothing since 2026-08-07** — every runner is stale, so pipelines fail at
-  `stuck_pending_no_matching_runners` without starting a job. A red pipeline is not a statement about
-  the code, and there has been no green one. `.build/sh/ci-local` is the substitute; say which runs
-  you actually did.
+- **GitLab CI runs again — read the failure before dismissing it.** The "every runner is stale,
+  pipelines fail at `stuck_pending_no_matching_runners`" era ended: project runner 77
+  (kopens-234) has been online since 2026-08-26 and jobs really execute (verified 2026-09-05).
+  So a red pipeline is now a statement about the code — pipeline #53500's `timeseries-tests`
+  failure was a real one, a test left behind by 417e5d2336. Check with
+  `glab api projects/common%2Fcassandra-timeseries/runners` and read the job trace
+  (`glab api projects/common%2Fcassandra-timeseries/jobs/<id>/trace`; `glab ci get -p <id>`
+  lists the jobs). `.build/sh/ci-local` is still the fuller gate — say which runs you actually did.
 - **Test runs must be serial.** `ci-test` starts with a `realclean`, so a second concurrent run
   deletes the first's `build/lib/jars` and the victim fails with hundreds of `package org.slf4j does
   not exist` errors that look like a broken change.

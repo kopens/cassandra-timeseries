@@ -15,14 +15,19 @@ base rows and cannot be rolled back, so "we ran the unit tests" is not a release
 
 ## 0. Know what CI is and is not telling you
 
-The project's GitLab runners have been offline since at least 2026-08-07. Every pipeline since fails
-with `stuck_pending_no_matching_runners` — the jobs never start. A red pipeline currently says
-nothing about the code, and a green one has not existed in weeks.
+This section used to say the runners were all offline and every pipeline died at
+`stuck_pending_no_matching_runners`. That is over: project runner 77 (kopens-234) has been online
+since 2026-08-26 and jobs execute (verified 2026-09-05). **A red pipeline is now evidence about the
+code, not about the runners** — pipeline #53500's `timeseries-tests` failure was a real test bug.
+Read the trace before dismissing one; `glab ci trace` renders a TUI that is unreadable when piped,
+so use the API instead.
 
 ```bash
 glab ci list --per-page 5
-glab ci get -p <id>            # failure_reason on the jobs
-glab api projects/common%2Fcassandra-timeseries/runners
+glab ci get -p <id>                                            # job names + statuses
+glab api projects/common%2Fcassandra-timeseries/runners        # is anything online?
+glab api projects/common%2Fcassandra-timeseries/pipelines/<id>/jobs
+glab api projects/common%2Fcassandra-timeseries/jobs/<id>/trace | sed -e 's/\x1b\[[0-9;]*m//g'
 ```
 
 Check this before quoting CI as evidence, and say plainly which of the runs below you actually did.
@@ -91,6 +96,22 @@ Two rules it enforces so the gate keeps meaning something:
 - **`--record` is explicit and never automatic.** "The numbers moved so I moved the line" is how a
   perf gate quietly stops existing. Re-record only for a deliberate trade, in the same commit as the
   change, and say so in the message.
+
+**A uniform slowdown across every benchmark is the host, not the code.** `ci-perf` refuses to gate
+across *hosts*, but it cannot tell that the right host is busy. On 2026-09-05 a post-merge run
+failed 15 benchmarks at +25% to +63% — and the tell was that *everything* moved the same way,
+including `ChunkBitUnpackBench.unpack[width=2]` (+62.9%), which is bit-twiddling over a byte array
+that the merge provably did not touch. `uptime` showed load average 27 with several browser
+processes at 200-290% CPU. Before reading a red `ci-perf` as a regression, check two things:
+
+```bash
+uptime; ps -eo pcpu,comm --sort=-pcpu | head          # is this machine actually idle?
+git diff --name-only <base> HEAD -- src/java/org/apache/cassandra/db/timeseries/ test/microbench/
+```
+
+If the second command is empty for the code under the failing benchmarks, the change cannot be the
+cause — say so, and re-run on an idle host rather than re-recording the baseline. A real regression
+is *selective*: it hits the benchmarks whose code changed and leaves the rest inside the noise band.
 
 **What a healthy run looks like.** On an unchanged tree against its own baseline, 24 of 27
 benchmarks land within ±3% and the worst sits near +18%. That spread is the floor of this machine's
