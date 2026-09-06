@@ -29,7 +29,11 @@ variables:
 default:
   image: eclipse-temurin:21-jdk
   before_script:
-    - apt-get update -qq && apt-get install -y -qq --no-install-recommends ant ant-optional python3 > /dev/null
+    # git: the temurin image ships without it, and build.xml's _get-git-sha then silently
+    # falls back, stamping Implementation-Git-SHA: Unknown into the jar. That attribute is
+    # the only way to trace a deployed jar back to a commit, so the build needs git present.
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends ant ant-optional python3 git > /dev/null
+    - git config --global --add safe.directory "$CI_PROJECT_DIR" || true
 
 build-jar:
   stage: build
@@ -37,6 +41,9 @@ build-jar:
   script:
     - ant clean jar checkstyle checkstyle-test
     - ls -l build/apache-cassandra-6.0.0.jar
+    # Fail loudly if the jar was built without a resolvable commit: an unstamped jar cannot be
+    # traced back from a deployed node, and _get-git-sha fails silently by design.
+    - python3 .build/sh/check-jar-git-sha.py build/apache-cassandra-6.0.0.jar "$CI_COMMIT_SHA"
     # Release artifacts carry the fork's name and the tag's version (build.xml stays at
     # base.version 6.0.0 per the versioning rule - only the published copies are renamed).
     - cp build/apache-cassandra-6.0.0.jar "build/apache-cassandra-timeseries-${CI_COMMIT_TAG:-dev}.jar"
